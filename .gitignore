@@ -1,3 +1,4 @@
 blacklist.txt
 whitelist.txt
 logs/
+.cache/

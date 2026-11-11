@@ -7,15 +7,31 @@ import shutil
 import logging
 import time
 import tempfile
+import json
 
-# Update logger to use sys.stdout instead of sys.stderr
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s: %(message)s',
-    datefmt='%H:%M:%S',
-    stream=sys.stdout
-)
+# Set up global directories
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+LOGS_DIR = os.path.join(DATA_DIR, "logs")
+CACHE_DIR = os.path.join(DATA_DIR, ".cache")
+DATE_SUFFIX = time.strftime("%Y%m%d-%H%M%S")
+
+# Configure logger to tee to both stdout and a date-stamped file
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s: %(message)s', datefmt='%H:%M:%S')
+
+stdout_handler = logging.StreamHandler(sys.stdout)
+stdout_handler.setFormatter(formatter)
+logger.addHandler(stdout_handler)
+
+try:
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    main_log_file = os.path.join(LOGS_DIR, f"mnemo_log_{DATE_SUFFIX}.log")
+    file_handler = logging.FileHandler(main_log_file)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+except Exception as e:
+    logger.warning(f"Failed to set up file logger in {LOGS_DIR}: {e}")
 
 
 def format_elapsed(start_time):
@@ -85,18 +101,27 @@ def find_crowded(limit=10, directory="."):
     logger.info(f"find_crowded elapsed time: {format_elapsed(start_time)}")
 
 
-def backup(dest_raw, sources, exclude, dry_run, verbose, blacklist=None, permissive=False, delete_mode=False, also_repos=False):
+def backup(dest_raw, sources, exclude, dry_run, verbose, blacklist=None, permissive=False, delete_mode=False, also_repos=False, no_cache=False):
     """Main backup logic handling Rsync, size checks, mountpoints, and file listing."""
     start_time = time.time()
     dest = os.path.abspath(dest_raw)
+
+    cache_file = os.path.join(CACHE_DIR, "cache.json")
 
     # Destination creation and mountpoint validation
     if not os.path.exists(dest):
         if dry_run:
             logger.info(f"[DRY-RUN] Would create destination directory: {dest}")
         else:
-            os.makedirs(dest, exist_ok=True)
-            logger.info(f"Created destination directory: {dest}")
+            try:
+                os.makedirs(dest, exist_ok=True)
+                logger.info(f"Created destination directory: {dest}")
+            except PermissionError:
+                logger.error(f"Permission denied creating destination directory '{dest}'. Is the destination partition mounted?")
+                sys.exit(1)
+            except OSError as e:
+                logger.error(f"Failed to create destination directory '{dest}': {e}")
+                sys.exit(1)
 
     mountpoint = get_mountpoint(dest if os.path.exists(dest) else os.path.dirname(dest))
     if mountpoint == '/':
@@ -111,25 +136,56 @@ def backup(dest_raw, sources, exclude, dry_run, verbose, blacklist=None, permiss
             logger.error(f"Blacklist file does not exist: {blacklist_path}")
             sys.exit(1)
 
-    # Dynamically find and exclude git repositories
+    # Dynamically find and exclude git repositories using cache
     if not also_repos:
-        logger.info("Scanning for git repositories to exclude...")
         git_excludes = []
-        for src in sources:
+        cache_data = {}
+        git_cache = {}
+        cache_updated = False
+
+        if not no_cache and os.path.exists(cache_file):
             try:
-                # -prune prevents traversing into the .git dir itself once found
-                cmd = ["find", src, "-type", "d", "-name", ".git", "-prune"]
-                find_res = subprocess.run(cmd, capture_output=True, text=True)
-                for line in find_res.stdout.splitlines():
-                    line = line.strip()
-                    if line:
-                        repo_dir = os.path.dirname(line)
-                        git_excludes.append(repo_dir)
+                with open(cache_file, 'r') as f:
+                    cache_data = json.load(f)
+                    git_cache = cache_data.get("git_repos", {})
             except Exception as e:
-                logger.warning(f"Failed to scan for git repositories in {src}: {e}")
+                logger.warning(f"Failed to read cache file: {e}")
+
+        for src in sources:
+            if not no_cache and src in git_cache:
+                cached_repos = git_cache[src]
+                logger.info(f"Loaded {len(cached_repos)} cached git repositories for {src}")
+                git_excludes.extend(cached_repos)
+            else:
+                logger.info(f"Scanning for git repositories in {src}...")
+                src_git_excludes = []
+                try:
+                    # -prune prevents traversing into the .git dir itself once found
+                    cmd = ["find", src, "-type", "d", "-name", ".git", "-prune"]
+                    find_res = subprocess.run(cmd, capture_output=True, text=True)
+                    for line in find_res.stdout.splitlines():
+                        line = line.strip()
+                        if line:
+                            repo_dir = os.path.dirname(line)
+                            src_git_excludes.append(repo_dir)
+                            git_excludes.append(repo_dir)
+
+                    git_cache[src] = src_git_excludes
+                    cache_updated = True
+                except Exception as e:
+                    logger.warning(f"Failed to scan for git repositories in {src}: {e}")
+
+        if cache_updated and not no_cache:
+            try:
+                os.makedirs(CACHE_DIR, exist_ok=True)
+                cache_data["git_repos"] = git_cache
+                with open(cache_file, 'w') as f:
+                    json.dump(cache_data, f, indent=4)
+                logger.info("Updated git repositories cache.")
+            except Exception as e:
+                logger.warning(f"Failed to write cache file: {e}")
 
         if git_excludes:
-            logger.info(f"Found and automatically excluding {len(git_excludes)} git repositories.")
             exclude.extend(git_excludes)
 
     # List selected files (using rsync dry-run to perfectly respect exclusions)
@@ -157,55 +213,49 @@ def backup(dest_raw, sources, exclude, dry_run, verbose, blacklist=None, permiss
         for f in files_list:
             print(f)
     else:
-        with tempfile.NamedTemporaryFile(delete=False, mode='w', prefix="mnemo_selected_", suffix=".txt") as tf:
+        selected_log_path = os.path.join(LOGS_DIR, f"mnemo_selected_{DATE_SUFFIX}.txt")
+        with open(selected_log_path, 'w') as tf:
             tf.write("\n".join(files_list) + "\n")
-            logger.info(f"Selected files list dumped to: {tf.name}")
+        logger.info(f"Selected files list dumped to: {selected_log_path}")
 
     # Precompute size requirements
     logger.info("Calculating required disk space...")
     required_bytes = get_directory_size(sources, exclude_list=exclude, blacklist_path=blacklist_path)
     free_bytes = shutil.disk_usage(mountpoint).free
 
-    logger.info(f"Required space: {required_bytes / (1024**3):.2f} GB")
+    logger.info(f"Required space: {required_bytes / (1024**3):.2f} GB ({len(files_list)} total files under sync)")
     logger.info(f"Available space: {free_bytes / (1024**3):.2f} GB")
 
     if required_bytes > free_bytes:
         if permissive:
-            logger.warning("Insufficient space on the destination partition (--permissive flag is active).")
+            logger.info("Permissive mode active: ignoring space constraints and proceeding.")
+        else:
+            logger.warning("Insufficient space on the destination partition (based on total source size).")
             try:
-                ans = input("Do you want to proceed with the backup anyway? [y/N]: ").strip().lower()
+                ans = input("Do you want to proceed with the backup anyway (assuming delta is smaller)? [y/N]: ").strip().lower()
                 if ans != 'y':
+                    ans_ncdu = input("Do you want to run 'ncdu' on the heaviest source entry to investigate? [y/N]: ").strip().lower()
+                    if ans_ncdu == 'y':
+                        if shutil.which("ncdu"):
+                            logger.info("Determining the heaviest source entry...")
+                            source_sizes = []
+                            for src in sources:
+                                source_sizes.append((get_directory_size([src], exclude, blacklist_path), src))
+
+                            # Sort by size descending and pick ONLY the top 1
+                            source_sizes.sort(key=lambda x: x[0], reverse=True)
+                            heaviest_source = source_sizes[0][1]
+
+                            logger.info(f"Launching ncdu on: {heaviest_source}")
+                            subprocess.run(["ncdu", heaviest_source])
+                        else:
+                            logger.error("The 'ncdu' utility is not installed or not found in PATH.")
                     logger.info("Halting backup process.")
                     sys.exit(1)
             except KeyboardInterrupt:
                 print()
                 logger.info("Prompt aborted by user.")
                 sys.exit(1)
-        else:
-            logger.error("Insufficient space on the destination partition.")
-            try:
-                ans = input("Do you want to run 'ncdu' on the heaviest source entry to investigate? [y/N]: ").strip().lower()
-                if ans == 'y':
-                    if shutil.which("ncdu"):
-                        logger.info("Determining the heaviest source entry...")
-                        source_sizes = []
-                        for src in sources:
-                            source_sizes.append((get_directory_size([src], exclude, blacklist_path), src))
-
-                        # Sort by size descending and pick ONLY the top 1
-                        source_sizes.sort(key=lambda x: x[0], reverse=True)
-                        heaviest_source = source_sizes[0][1]
-
-                        logger.info(f"Launching ncdu on: {heaviest_source}")
-                        subprocess.run(["ncdu", heaviest_source])
-                    else:
-                        logger.error("The 'ncdu' utility is not installed or not found in PATH.")
-            except KeyboardInterrupt:
-                print()
-                logger.info("Prompt aborted by user.")
-
-            logger.info("Halting backup process.")
-            sys.exit(1)
 
     # Deletion Mode Safety Prompt
     if delete_mode and not dry_run:
@@ -244,14 +294,27 @@ def backup(dest_raw, sources, exclude, dry_run, verbose, blacklist=None, permiss
 
     # Run backup
     logger.info(f"Starting backup...")
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, mode='w', prefix="mnemo_backup_stdout_", suffix=".log") as out_f, \
-             tempfile.NamedTemporaryFile(delete=False, mode='w', prefix="mnemo_backup_stderr_", suffix=".log") as err_f:
 
+    stdout_log_path = os.path.join(LOGS_DIR, f"mnemo_backup_stdout_{DATE_SUFFIX}.log")
+    stderr_log_path = os.path.join(LOGS_DIR, f"mnemo_backup_stderr_{DATE_SUFFIX}.log")
+
+    tail_proc = None
+    try:
+        with open(stdout_log_path, 'w') as out_f, open(stderr_log_path, 'w') as err_f:
             logger.info(f"Rsync stdout redirected to: {out_f.name}")
             logger.info(f"Rsync stderr redirected to: {err_f.name}")
+            logger.info(f"To monitor progress in another terminal, run: watch ls -lh {LOGS_DIR}/mnemo_backup_*")
+
+            logger.info("Starting live tail of rsync stdout...")
+            # Spawn tail in the background to output to the current terminal
+            tail_proc = subprocess.Popen(["tail", "-f", out_f.name])
 
             backup_result = subprocess.run(rsync_cmd, stdout=out_f, stderr=err_f)
+
+            if tail_proc:
+                tail_proc.terminate()
+                tail_proc.wait()
+                tail_proc = None
 
             # 11 = Error in file I/O (e.g. ENOSPC / Disk Full)
             if backup_result.returncode == 11:
@@ -267,11 +330,19 @@ def backup(dest_raw, sources, exclude, dry_run, verbose, blacklist=None, permiss
             else:
                 logger.error(f"Rsync failed with return code {backup_result.returncode}. Check {err_f.name} for details.")
                 sys.exit(1)
+    except KeyboardInterrupt:
+        print()
+        logger.critical("Backup interrupted by user (KeyboardInterrupt). Exiting gracefully.")
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Backup execution failed: {e}")
         sys.exit(1)
     finally:
+        if tail_proc:
+            tail_proc.terminate()
+            tail_proc.wait()
         logger.info(f"backup elapsed time: {format_elapsed(start_time)}")
+        logger.info(f"*** Reminder: Please safely unmount '{mountpoint}' before physically disconnecting the drive. ***")
 
 
 def main(args=None):
@@ -291,6 +362,7 @@ def main(args=None):
     parser.add_argument("--permissive", action="store_true", help="Skip sufficient space checks and prompt for continuation")
     parser.add_argument("--delete", action="store_true", help="Enable rsync deletion mode")
     parser.add_argument("--also-repos", action="store_true", help="Do not automatically exclude git repositories")
+    parser.add_argument("--no-cache", action="store_true", help="Disable caching of scanned results (like git repositories)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Print selected files to stdout instead of a temp file")
     parser.add_argument("--dry-run", action="store_true", help="Print actions and exit")
 
@@ -345,7 +417,8 @@ def main(args=None):
             blacklist=parsed_args.blacklist,
             permissive=parsed_args.permissive,
             delete_mode=parsed_args.delete,
-            also_repos=parsed_args.also_repos
+            also_repos=parsed_args.also_repos,
+            no_cache=parsed_args.no_cache
         )
 
 
