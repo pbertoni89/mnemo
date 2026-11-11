@@ -9,6 +9,7 @@ import time
 import tempfile
 import json
 import csv
+import math
 import hashlib
 from collections import defaultdict
 
@@ -104,6 +105,24 @@ def find_crowded(limit=10, directory="."):
     logger.info(f"find_crowded elapsed time: {format_elapsed(start_time)}")
 
 
+def is_within(path, parent):
+    """True if `path` is `parent` or lies under it, after resolving symlinks and '..'."""
+    path, parent = os.path.realpath(path), os.path.realpath(parent)
+    return os.path.commonpath([path, parent]) == parent
+
+
+def check_destination_outside_sources(dest, sources):
+    """Halt if the destination is one of the sources or lies inside one of them.
+
+    Otherwise each run would copy the destination into itself (and --delete could
+    remove files from the source).
+    """
+    for src in sources:
+        if is_within(dest, src):
+            logger.error(f"Destination {dest} is inside source {src}: it would be copied into itself. Halting.")
+            sys.exit(1)
+
+
 def prepare_destination(dest, dry_run):
     """Create the destination if needed and return its mountpoint, halting if it is '/'."""
     if not os.path.exists(dest):
@@ -197,8 +216,43 @@ def find_duplicate_groups(src):
     return groups, singles
 
 
-def rsync_file_list(chosen, singles, dest, dry_run):
-    """Copy `chosen` duplicates and `singles`, both [(abs path, md5 or None)], to dest/<abs path>.
+def squeeze_target(src, dest):
+    """Where --squeeze-dups puts `src`: dest/<basename of src>."""
+    return os.path.join(dest, os.path.basename(src))
+
+
+def du_bytes(path):
+    """Disk usage of `path` in bytes (du -s), or None if it can't be measured."""
+    if not os.path.exists(path):
+        return None
+    result = subprocess.run(["du", "-s", "--block-size=1", path], capture_output=True, text=True)
+    try:
+        return int(result.stdout.split()[0])
+    except (IndexError, ValueError):
+        return None
+
+
+def human_size(n):
+    """Format a byte count like du -h does (powers of 1024, rounded up, one decimal below 10)."""
+    if n is None:
+        return "n/a"
+    sign = "-" if n < 0 else ""
+    value = abs(n)
+    if value < 1024:
+        return f"{sign}{value}"
+    for unit in "KMGTPE":
+        value /= 1024
+        if value < 10:
+            value = math.ceil(value * 10) / 10
+            if value < 10:
+                return f"{sign}{value:.1f}{unit}"
+        value = math.ceil(value)
+        if value < 1024 or unit == "E":
+            return f"{sign}{value}{unit}"
+
+
+def rsync_file_list(chosen, singles, src, dest, dry_run):
+    """Copy `chosen` duplicates and `singles`, both [(abs path, md5 or None)] under `src`, to dest/<basename of src>/.
 
     Everything goes in one rsync --files-from pass, so files already up to date at the
     destination are skipped and re-runs are cheap. Every entry is also recorded in
@@ -223,26 +277,28 @@ def rsync_file_list(chosen, singles, dest, dry_run):
     chosen_set = {path for path, _digest in chosen}
     transferred = 0
 
-    # rsync's input list is a throwaway temp file: NUL-separated (--from0) so any name is safe,
-    # relative to '/', which is the rsync source. --files-from implies --relative, recreating
-    # the absolute source path under dest; --out-format prints one line per transferred item.
+    # rsync's input list is a throwaway temp file: NUL-separated (--from0) so any name is safe.
+    # Paths are relative to the parent of src, which is the rsync source dir; --files-from implies
+    # --relative, so they are recreated as dest/<basename of src>/... --out-format prints one line
+    # per transferred item, relative to that same parent.
+    base = os.path.dirname(src)
     with tempfile.NamedTemporaryFile('w', prefix="mnemo_squeeze_dups_", suffix=".lst") as list_f:
-        list_f.write(''.join(path.lstrip(os.sep) + '\0' for _was_dup, path, _digest in entries))
+        list_f.write(''.join(os.path.relpath(path, base) + '\0' for _was_dup, path, _digest in entries))
         list_f.flush()
 
         cmd = ["rsync", "-a", "--from0", f"--files-from={list_f.name}", "--out-format=%n"]
         if dry_run:
             cmd.append("--dry-run")
-        cmd.extend(["/", dest + "/"])
+        cmd.extend([base.rstrip(os.sep) + "/", dest + "/"])
 
-        logger.info(f"Syncing {len(entries)} entries to {dest} (rsync stderr: {stderr_log_path})...")
+        logger.info(f"Syncing {len(entries)} entries to {squeeze_target(src, dest)} (rsync stderr: {stderr_log_path})...")
         with open(stderr_log_path, 'a') as err_f:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err_f, text=True, errors='replace')
             for line in proc.stdout:
                 name = line.rstrip('\n')
                 if not name or name.endswith('/'):
                     continue  # parent directories created along the way
-                path = os.sep + name
+                path = os.path.join(base, name)
                 kind = "chosen duplicate" if path in chosen_set else "non-duplicate"
                 logger.info(f"{prefix} ({kind}): {path}")
                 transferred += 1
@@ -280,22 +336,45 @@ def prompt_dup_choice(count):
 
 
 def squeeze_dups(dest_raw, sources, dry_run):
-    """Copy each source to dest/<abs path>, keeping only one user-chosen copy of each set of duplicates.
+    """Copy each source to dest/<basename of source>, keeping only one user-chosen copy of each set of duplicates.
 
     Per source: ask about every duplicate group first, then copy the chosen files plus
     every non-duplicate file in one rsync pass. On 'q', only the choices made so far
     in the current source are copied, and the remaining sources are not processed.
+    At the end, logs the du -sh size of each processed source and of its copy.
     """
     start_time = time.time()
     dest = os.path.abspath(dest_raw)
+
+    # Sources land at dest/<basename>, so two sources with the same basename would merge
+    basenames = defaultdict(list)
+    for src in sources:
+        basenames[os.path.basename(src)].append(src)
+    clashes = {name: srcs for name, srcs in basenames.items() if len(srcs) > 1}
+    if clashes:
+        for name, srcs in clashes.items():
+            logger.error(f"Sources {', '.join(srcs)} would all be copied to {os.path.join(dest, name)}.")
+        logger.error("Each source must have a different basename. Halting.")
+        sys.exit(1)
+
+    check_destination_outside_sources(dest, sources)
+    # e.g. --source /x/foo --destination /x would copy /x/foo onto itself
+    for src in sources:
+        target = squeeze_target(src, dest)
+        if is_within(target, src) or is_within(src, target):
+            logger.error(f"Source {src} would be copied to {target}, which overlaps it. Halting.")
+            sys.exit(1)
+
     mountpoint = prepare_destination(dest, dry_run)
 
     sticky = None  # 'a' or 'b' once the user picks "always first/last"
     copied = 0
     skipped = 0
     quit_requested = False
+    processed = []
 
     for src in sources:
+        processed.append(src)
         groups, singles = find_duplicate_groups(src)
         logger.info(f"Found {len(groups)} groups of duplicates and {len(singles)} non-duplicate entries in {src}")
         chosen = []
@@ -341,14 +420,23 @@ def squeeze_dups(dest_raw, sources, dry_run):
                 singles[i] = (path, md5_file(path))
 
         if chosen or singles:
-            copied += rsync_file_list(chosen, singles, dest, dry_run)
+            copied += rsync_file_list(chosen, singles, src, dest, dry_run)
 
         if quit_requested:
             break
 
     verb = "Would copy" if dry_run else "Copied"
     logger.info(f"{verb} {copied} files, skipped {skipped} duplicate groups.")
-    logger.info(f"squeeze_dups elapsed time: {format_elapsed(start_time)}")
+    logger.info("--- Space used (du -sh) ---")
+    spared = None
+    for src in processed:
+        target = squeeze_target(src, dest)
+        src_size, target_size = du_bytes(src), du_bytes(target)
+        logger.info(f"  {human_size(src_size):>6}  {src}")
+        logger.info(f"  {human_size(target_size):>6}  {target}")
+        if src_size is not None and target_size is not None:
+            spared = (spared or 0) + src_size - target_size
+    logger.info(f"squeeze_dups elapsed time: {format_elapsed(start_time)}, spared space: {human_size(spared)}")
     if not dry_run and copied:
         logger.info(f"*** Reminder: Please safely unmount '{mountpoint}' before physically disconnecting the drive. ***")
 
@@ -360,6 +448,7 @@ def backup(dest_raw, sources, exclude, dry_run, verbose, blacklist=None, permiss
 
     cache_file = os.path.join(CACHE_DIR, "cache.json")
 
+    check_destination_outside_sources(dest, sources)
     mountpoint = prepare_destination(dest, dry_run)
 
     # Prepare exclusions for Rsync

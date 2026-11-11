@@ -3,8 +3,8 @@
 A small backup helper for Linux. It copies the directories you care about onto an external drive with `rsync`, and it gives you a few tools for deciding what is worth copying.
 
 - **Incremental**: only new or changed files are copied, so the second run is much faster than the first.
-- **Safe by default**: it refuses to write anywhere that isn't a separate mount, checks free space before starting, asks before deleting anything, and has `--dry-run` for every mode.
-- **Readable layout**: files land at `DESTINATION/<their absolute path>`. For example, `/home/me/Documents/cv.pdf` ends up at `DESTINATION/home/me/Documents/cv.pdf`, so restoring a file is a plain copy.
+- **Safe by default**: it refuses to write anywhere that isn't a separate mount or that lies inside a folder being backed up, checks free space before starting, asks before deleting anything, and has `--dry-run` for every mode.
+- **Readable layout**: `--backup` puts files at `DESTINATION/<their absolute path>`. For example, `/home/me/Documents/cv.pdf` ends up at `DESTINATION/home/me/Documents/cv.pdf`, so restoring a file is a plain copy. `--squeeze-dups` instead puts each source folder directly under the destination, by its own name (see below).
 
 ## Requirements
 
@@ -134,10 +134,20 @@ Add the culprits to `blacklist.txt` and run the backup again. If the destination
 `--squeeze-dups` suits folders like `Downloads` or an old photo dump, where the same file sits in several places. It copies everything, but for each set of byte-identical files it shows you every copy and asks which one to keep:
 
 ```bash
-./mnemo/mnemo.py --squeeze-dups --source ~/Downloads
+./mnemo/mnemo.py --squeeze-dups --source ~/Downloads --destination /run/media/me/BIGDISK/squeezed
 # or, with driver.sh loaded:
-mnemo_squeeze_dups ~/Downloads
+mnemo_squeeze_dups ~/Downloads --destination /run/media/me/BIGDISK/squeezed
 ```
+
+Each source is copied into a folder with the same name directly under the destination, so `~/Downloads` becomes `/run/media/me/BIGDISK/squeezed/Downloads`. Relative paths work too, which is handy on the backup drive itself:
+
+```bash
+cd /run/media/me/BIGDISK/dumps-audio
+mnemo_squeeze_dups . --destination ../dumps-squeezed-audio
+# -> /run/media/me/BIGDISK/dumps-squeezed-audio/dumps-audio
+```
+
+Because of this, two sources can't share a name (for example `~/a/photos` and `~/b/photos`). mnemo refuses to start rather than mix them. It also refuses a destination that would land on the source itself, such as `--source /x/foo --destination /x`.
 
 ```text
 --- Duplicate group 1/2: md5 b1946ac92492d2347c6235b4d2611184, 6 bytes each ---
@@ -146,7 +156,7 @@ mnemo_squeeze_dups ~/Downloads
 Save which one? [1-2], a=always first, b=always last, s=skip, q=quit: 1
 ```
 
-Pressing `1` saves `DESTINATION/home/me/Downloads/baz/gem.txt`. `foo/bar.txt` is not copied.
+Pressing `1` saves `DESTINATION/Downloads/baz/gem.txt`. `foo/bar.txt` is not copied.
 
 | Answer | Effect |
 |---|---|
@@ -164,6 +174,16 @@ Things to know:
 - Duplicates are matched only within the same `--source` folder, not across folders.
 - The blacklist does **not** apply to this mode.
 - Your source folders are never modified. To actually free space, delete the extra copies yourself.
+- At the end, mnemo shows how much space each source and its squeezed copy take, and the total space spared across all sources:
+
+  ```text
+  --- Space used (du -sh) ---
+       41G  /home/me/Downloads
+       29G  /run/media/me/BIGDISK/squeezed/Downloads
+  squeeze_dups elapsed time: 00h 12m 40s, spared space: 12G
+  ```
+
+  On a dry run nothing is copied, so the copy's size and the spared space show `n/a`.
 
 Each run also records every file it sent to the destination in `logs/mnemo_squeeze_dups_<timestamp>.csv`:
 
@@ -184,7 +204,7 @@ A quick way to see only the duplicates you kept: `grep '^true,' logs/mnemo_squee
 To preview the choices and the list of files that would be copied, without copying anything:
 
 ```bash
-mnemo_squeeze_dups ~/Downloads --dry-run
+mnemo_squeeze_dups ~/Downloads --destination /run/media/me/BIGDISK/squeezed --dry-run
 ```
 
 ## Logs
@@ -209,5 +229,7 @@ watch ls -lh ~/opt/mnemo/logs/mnemo_backup_*
 
 - **"Destination mountpoint is '/'"**: the drive isn't mounted, so the destination would end up on your system disk. Mount the drive and try again.
 - **"Permission denied creating destination directory"**: same cause; check that the drive is mounted and writable.
+- **"Destination … is inside source …"**: the destination is one of the folders being backed up, or lies inside one. Every run would copy the backup into itself. Pick a destination outside all sources, such as a sibling folder (`../something`).
+- **"Source … would be copied to …, which overlaps it"** (`--squeeze-dups`): the source would be copied onto itself, usually because `--destination` is the source's parent folder. Use a different destination.
 - **A new git repository is still being backed up, or an old one skipped**: the list of repositories is cached in `.cache/cache.json`. Delete that file to rescan, or use `--no-cache` for a single run.
 - **"Backup completed with rsync warnings (code 23/24)"**: some files couldn't be read or vanished during the copy. Check the `*_stderr_*` log for details.
