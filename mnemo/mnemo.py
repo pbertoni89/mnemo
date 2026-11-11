@@ -8,6 +8,9 @@ import logging
 import time
 import tempfile
 import json
+import csv
+import hashlib
+from collections import defaultdict
 
 # Set up global directories
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
@@ -101,14 +104,8 @@ def find_crowded(limit=10, directory="."):
     logger.info(f"find_crowded elapsed time: {format_elapsed(start_time)}")
 
 
-def backup(dest_raw, sources, exclude, dry_run, verbose, blacklist=None, permissive=False, delete_mode=False, also_repos=False, no_cache=False):
-    """Main backup logic handling Rsync, size checks, mountpoints, and file listing."""
-    start_time = time.time()
-    dest = os.path.abspath(dest_raw)
-
-    cache_file = os.path.join(CACHE_DIR, "cache.json")
-
-    # Destination creation and mountpoint validation
+def prepare_destination(dest, dry_run):
+    """Create the destination if needed and return its mountpoint, halting if it is '/'."""
     if not os.path.exists(dest):
         if dry_run:
             logger.info(f"[DRY-RUN] Would create destination directory: {dest}")
@@ -127,6 +124,243 @@ def backup(dest_raw, sources, exclude, dry_run, verbose, blacklist=None, permiss
     if mountpoint == '/':
         logger.error(f"Destination mountpoint is '/'. Expected an external mount. Halting.")
         sys.exit(1)
+    return mountpoint
+
+
+def md5_file(path, chunk_size=1024 * 1024):
+    """Return the hex md5 digest of a file, or None if it cannot be read."""
+    h = hashlib.md5()
+    try:
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(chunk_size), b''):
+                h.update(chunk)
+    except OSError as e:
+        logger.warning(f"Cannot hash {path}: {e}")
+        return None
+    return h.hexdigest()
+
+
+def find_duplicate_groups(src):
+    """Walk `src` and split its entries into duplicate groups and singles.
+
+    Returns (groups, singles): groups is [(md5, [sorted paths])] for every set of
+    byte-identical files; singles is [(path, md5 or None)] for every other entry
+    (unique files, empty files, symlinks, unreadable files), which gets copied without
+    asking. Files are first bucketed by size, so only same-size files get hashed:
+    a single's md5 is None unless it happened to be hashed.
+    """
+    logger.info(f"Walking {src}...")
+    by_size = defaultdict(list)
+    singles = []
+    for root, dirs, files in os.walk(src):
+        # os.walk lists symlinks to directories under dirs without following them
+        singles.extend((os.path.join(root, d), None) for d in dirs if os.path.islink(os.path.join(root, d)))
+        for name in files:
+            path = os.path.join(root, name)
+            try:
+                if os.path.islink(path):
+                    singles.append((path, None))
+                    continue
+                size = os.path.getsize(path)
+            except OSError as e:
+                logger.warning(f"Cannot stat {path}: {e}")
+                singles.append((path, None))  # let rsync try, and report, it
+                continue
+            if size > 0:
+                by_size[size].append(path)
+            else:
+                singles.append((path, None))
+
+    candidates = []
+    for paths in by_size.values():
+        if len(paths) > 1:
+            candidates.extend(paths)
+        else:
+            singles.append((paths[0], None))
+    logger.info(f"Hashing {len(candidates)} same-size candidate files in {src}...")
+
+    by_hash = defaultdict(list)
+    for path in candidates:
+        digest = md5_file(path)
+        if digest:
+            by_hash[digest].append(path)
+        else:
+            singles.append((path, None))
+
+    groups = []
+    for digest, paths in by_hash.items():
+        if len(paths) > 1:
+            groups.append((digest, sorted(paths)))
+        else:
+            singles.append((paths[0], digest))
+    groups.sort(key=lambda g: g[1][0])
+    return groups, singles
+
+
+def rsync_file_list(chosen, singles, dest, dry_run):
+    """Copy `chosen` duplicates and `singles`, both [(abs path, md5 or None)], to dest/<abs path>.
+
+    Everything goes in one rsync --files-from pass, so files already up to date at the
+    destination are skipped and re-runs are cheap. Every entry is also recorded in
+    logs/mnemo_squeeze_dups_<date>.csv (was_dup,md5sum,path).
+    Logs one line per file actually transferred and returns how many there were.
+    Halts on fatal rsync errors; partial-transfer codes 23/24 only warn.
+    """
+    entries = [(True, path, digest) for path, digest in chosen] + [(False, path, digest) for path, digest in singles]
+
+    csv_path = os.path.join(LOGS_DIR, f"mnemo_squeeze_dups_{DATE_SUFFIX}.csv")
+    write_header = not os.path.exists(csv_path)
+    with open(csv_path, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(["was_dup", "md5sum", "path"])
+        for was_dup, path, digest in entries:
+            writer.writerow([str(was_dup).lower(), digest or "", path])
+    logger.info(f"Entries for this source recorded in: {csv_path}")
+
+    stderr_log_path = os.path.join(LOGS_DIR, f"mnemo_squeeze_dups_stderr_{DATE_SUFFIX}.log")
+    prefix = "[DRY-RUN] Would copy" if dry_run else "Copied"
+    chosen_set = {path for path, _digest in chosen}
+    transferred = 0
+
+    # rsync's input list is a throwaway temp file: NUL-separated (--from0) so any name is safe,
+    # relative to '/', which is the rsync source. --files-from implies --relative, recreating
+    # the absolute source path under dest; --out-format prints one line per transferred item.
+    with tempfile.NamedTemporaryFile('w', prefix="mnemo_squeeze_dups_", suffix=".lst") as list_f:
+        list_f.write(''.join(path.lstrip(os.sep) + '\0' for _was_dup, path, _digest in entries))
+        list_f.flush()
+
+        cmd = ["rsync", "-a", "--from0", f"--files-from={list_f.name}", "--out-format=%n"]
+        if dry_run:
+            cmd.append("--dry-run")
+        cmd.extend(["/", dest + "/"])
+
+        logger.info(f"Syncing {len(entries)} entries to {dest} (rsync stderr: {stderr_log_path})...")
+        with open(stderr_log_path, 'a') as err_f:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err_f, text=True, errors='replace')
+            for line in proc.stdout:
+                name = line.rstrip('\n')
+                if not name or name.endswith('/'):
+                    continue  # parent directories created along the way
+                path = os.sep + name
+                kind = "chosen duplicate" if path in chosen_set else "non-duplicate"
+                logger.info(f"{prefix} ({kind}): {path}")
+                transferred += 1
+            returncode = proc.wait()
+
+    up_to_date = len(entries) - transferred
+    if up_to_date > 0:
+        logger.info(f"{up_to_date} entries were already up to date at the destination.")
+
+    if returncode == 0:
+        return transferred
+    if returncode in (23, 24):
+        logger.warning(f"Copy completed with rsync warnings (code {returncode}). Check {stderr_log_path} for details.")
+        return transferred
+    if returncode == 11:
+        logger.error(f"Insufficient space encountered during transfer (rsync code 11). Check {stderr_log_path} for details. Halting immediately.")
+    else:
+        logger.error(f"Rsync failed with return code {returncode}. Check {stderr_log_path} for details.")
+    sys.exit(1)
+
+
+def prompt_dup_choice(count):
+    """Ask which duplicate to save. Returns an int in [1, count], or 'a', 'b', 's' or 'q'."""
+    while True:
+        try:
+            ans = input(f"Save which one? [1-{count}], a=always first, b=always last, s=skip, q=quit: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return 'q'
+        if ans in ('a', 'b', 's', 'q'):
+            return ans
+        if ans.isdigit() and 1 <= int(ans) <= count:
+            return int(ans)
+        print(f"Invalid choice '{ans}'.")
+
+
+def squeeze_dups(dest_raw, sources, dry_run):
+    """Copy each source to dest/<abs path>, keeping only one user-chosen copy of each set of duplicates.
+
+    Per source: ask about every duplicate group first, then copy the chosen files plus
+    every non-duplicate file in one rsync pass. On 'q', only the choices made so far
+    in the current source are copied, and the remaining sources are not processed.
+    """
+    start_time = time.time()
+    dest = os.path.abspath(dest_raw)
+    mountpoint = prepare_destination(dest, dry_run)
+
+    sticky = None  # 'a' or 'b' once the user picks "always first/last"
+    copied = 0
+    skipped = 0
+    quit_requested = False
+
+    for src in sources:
+        groups, singles = find_duplicate_groups(src)
+        logger.info(f"Found {len(groups)} groups of duplicates and {len(singles)} non-duplicate entries in {src}")
+        chosen = []
+
+        for i, (digest, paths) in enumerate(groups, 1):
+            size = os.path.getsize(paths[0])
+            logger.info(f"--- Duplicate group {i}/{len(groups)}: md5 {digest}, {size} bytes each ---")
+            for n, path in enumerate(paths, 1):
+                logger.info(f"  {n}) {path}")
+
+            if sticky:
+                choice = 1 if sticky == 'a' else len(paths)
+            else:
+                ans = prompt_dup_choice(len(paths))
+                if ans == 'q':
+                    quit_requested = True
+                    break
+                if ans == 's':
+                    skipped += 1
+                    logger.info("Skipped.")
+                    continue
+                if ans in ('a', 'b'):
+                    sticky = ans
+                    choice = 1 if ans == 'a' else len(paths)
+                else:
+                    choice = ans
+
+            selected = paths[choice - 1]
+            chosen.append((selected, digest))
+            logger.info(f"Selected {selected}")
+
+        if quit_requested:
+            logger.info("Quit requested by user: copying only the duplicates chosen so far in this source.")
+            singles = []
+
+        # Fill in the md5 of singles that were never hashed (unique size), for the CSV.
+        # Symlinks are recorded without one; unreadable files are left for rsync to report.
+        to_hash = [i for i, (path, digest) in enumerate(singles) if digest is None and os.path.isfile(path) and not os.path.islink(path)]
+        if to_hash:
+            logger.info(f"Hashing {len(to_hash)} non-duplicate files in {src} for the CSV record...")
+            for i in to_hash:
+                path = singles[i][0]
+                singles[i] = (path, md5_file(path))
+
+        if chosen or singles:
+            copied += rsync_file_list(chosen, singles, dest, dry_run)
+
+        if quit_requested:
+            break
+
+    verb = "Would copy" if dry_run else "Copied"
+    logger.info(f"{verb} {copied} files, skipped {skipped} duplicate groups.")
+    logger.info(f"squeeze_dups elapsed time: {format_elapsed(start_time)}")
+    if not dry_run and copied:
+        logger.info(f"*** Reminder: Please safely unmount '{mountpoint}' before physically disconnecting the drive. ***")
+
+
+def backup(dest_raw, sources, exclude, dry_run, verbose, blacklist=None, permissive=False, delete_mode=False, also_repos=False, no_cache=False):
+    """Main backup logic handling Rsync, size checks, mountpoints, and file listing."""
+    start_time = time.time()
+    dest = os.path.abspath(dest_raw)
+
+    cache_file = os.path.join(CACHE_DIR, "cache.json")
+
+    mountpoint = prepare_destination(dest, dry_run)
 
     # Prepare exclusions for Rsync
     blacklist_path = None
@@ -353,6 +587,7 @@ def main(args=None):
     group.add_argument("--backup", action="store_true", help="Run the gradual backup process")
     group.add_argument("--heavy", type=int, nargs='?', const=10, metavar='N', help="Find the N heaviest files in the sources")
     group.add_argument("--crowded", type=int, nargs='?', const=10, metavar='N', help="Find the N most crowded directories in the sources")
+    group.add_argument("--squeeze-dups", action="store_true", help="Copy each source to the destination, keeping one interactively chosen copy of each set of identical files")
 
     parser.add_argument("--destination", default="/run/media/pbertoni/storage/pb-backup/", help="Destination directory (USB mount expected)")
     parser.add_argument("--source", nargs='*', default=[], help="Directories to backup/analyze")
@@ -404,6 +639,10 @@ def main(args=None):
     if parsed_args.crowded is not None:
         for src in sources:
             find_crowded(parsed_args.crowded, src)
+        sys.exit(0)
+
+    if parsed_args.squeeze_dups:
+        squeeze_dups(parsed_args.destination, sources, parsed_args.dry_run)
         sys.exit(0)
 
     # Proceed with --backup logic

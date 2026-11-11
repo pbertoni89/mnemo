@@ -1,4 +1,6 @@
 blacklist.txt
 whitelist.txt
+
 logs/
 .cache/
+__pycache__/

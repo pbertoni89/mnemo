@@ -7,6 +7,12 @@ function mnemo_quick() {
 }
 
 
+# Usage: mnemo_squeeze_dups DIR [DIR...] [--dry-run] [--destination DEST]
+function mnemo_squeeze_dups() {
+  "$(dirname "${BASH_SOURCE[0]}")"/mnemo/mnemo.py --squeeze-dups --source "$@"
+}
+
+
 function mnemo_old_stuff_ignore_yet_keep_me() {
   dstPathRoot=/run/media/pbertoni/PBHDL/$(date -I"minutes")-linux-backup
   dstPathArch=${dstPathRoot}.tar.gz
