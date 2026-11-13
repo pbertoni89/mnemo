@@ -4,7 +4,9 @@ This file guides Claude Code (claude.ai/code) when working in this repository.
 
 ## What this is
 
-`mnemo` is a personal, single-file backup tool: a Python 3 CLI (`mnemo/mnemo.py`) that wraps `rsync` to copy a set of source directories onto an external drive in increments. It has no dependencies beyond the standard library and the system tools `rsync`, `du`, `find`, `tail` and `ncdu` (optional). There is no build step, test suite or linter config.
+`mnemo` is a personal backup tool: a Python 3 CLI (`mnemo/driver.py`) that wraps `rsync` to copy a set of source directories onto an external drive in increments. It has no dependencies beyond the standard library and the system tools `rsync`, `du`, `find`, `tail` and `ncdu` (optional). The one exception is `--stt`, which needs faster-whisper from the uv venv in `.venv/` (see below). There is no build step, test suite or linter config.
+
+The code is in two files. `mnemo/driver.py` is the executable: the modes, their helpers and `main()`. `mnemo/__init__.py` holds the shared plumbing that isn't specific to one mode: the repo paths (`DATA_DIR`, `LOGS_DIR`, `CACHE_DIR`, `DATE_SUFFIX`), the tee `logger`, and generic helpers (`get_env`, `parse_bool`, `format_elapsed`, `get_mountpoint`, `is_within`, `get_directory_size`, `du_bytes`, `human_size`, `md5_file`). `driver.py` puts the repo root on `sys.path` and imports these names from the package, because when it runs as a script Python only adds `mnemo/` to the path. Put new generic helpers in `__init__.py` and keep `driver.py` for feature code.
 
 `README.md` is the user-facing documentation. Keep it in sync when you change flags, prompts or behaviour.
 
@@ -13,20 +15,23 @@ This file guides Claude Code (claude.ai/code) when working in this repository.
 ```bash
 # Typical invocation (what driver.sh's mnemo_quick does; run it from the repo root,
 # because the list paths are relative to the current directory)
-./mnemo/mnemo.py --whitelist ./whitelist.txt --blacklist ./blacklist.txt --backup
+./mnemo/driver.py --whitelist ./whitelist.txt --blacklist ./blacklist.txt --backup
 
 # Always try changes with a dry run first
-./mnemo/mnemo.py --whitelist ./whitelist.txt --blacklist ./blacklist.txt --backup --dry-run
+./mnemo/driver.py --whitelist ./whitelist.txt --blacklist ./blacklist.txt --backup --dry-run
 
 # Analysis modes
-./mnemo/mnemo.py --whitelist ./whitelist.txt --heavy 20     # heaviest files per source
-./mnemo/mnemo.py --whitelist ./whitelist.txt --crowded 20   # dirs with the most files per source
+./mnemo/driver.py --whitelist ./whitelist.txt --heavy 20     # heaviest files per source
+./mnemo/driver.py --whitelist ./whitelist.txt --crowded 20   # dirs with the most files per source
 
 # Copy keeping one copy of each set of duplicates (driver.sh: mnemo_squeeze_dups DIR [DIR...])
-./mnemo/mnemo.py --squeeze-dups --source DIR [DIR...] [--dry-run]
+./mnemo/driver.py --squeeze-dups --source DIR [DIR...] [--dry-run]
+
+# Transcribe audio to sibling .txt files (driver.sh: mnemo_stt DIR [DIR...]; env built by mnemo_stt_setup [force])
+./mnemo/driver.py --stt --source DIR [DIR...] [--dry-run]
 ```
 
-The modes `--backup`, `--heavy`, `--crowded` and `--squeeze-dups` are mutually exclusive, and exactly one is required. Sources come from `--source` and/or `--whitelist`; `main()` makes them absolute and checks they exist.
+The modes `--backup`, `--heavy`, `--crowded`, `--squeeze-dups` and `--stt` are mutually exclusive, and exactly one is required. Sources come from `--source` and/or `--whitelist`; `main()` makes them absolute and checks they exist.
 
 `driver.sh` is meant to be `source`d, not executed. `mnemo_old_stuff_ignore_yet_keep_me` is a legacy full-system `tar` backup that the user wants kept; don't delete or "clean up" it.
 
@@ -39,8 +44,9 @@ The modes `--backup`, `--heavy`, `--crowded` and `--squeeze-dups` are mutually e
   - `--backup`: `mnemo_selected_*` (the file list) and `mnemo_backup_stdout_*` / `mnemo_backup_stderr_*` (rsync output).
   - `--squeeze-dups`: `mnemo_squeeze_dups_*.csv` (`was_dup,md5sum,path` for every entry sent to rsync, appended per source) and `mnemo_squeeze_dups_stderr_*`.
 - `.cache/cache.json`: `{"git_repos": {<abs source path>: [<repo dirs>]}}`. Gitignored.
+- `.venv/`: the uv environment for `--stt` (Python 3.12, faster-whisper, `av<19`, and the `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` wheels when `nvidia-smi` sees a GPU). Built by `mnemo_stt_setup`. Gitignored.
 
-`DATA_DIR` is resolved as the parent of the script's directory (the repo root), so logs and cache always land in the repo, whatever the cwd. The log file is opened when the module loads, so **every invocation, even `--help`, creates a `logs/mnemo_log_*` file**. Delete the ones your own test runs create.
+`DATA_DIR` is resolved as the parent of the package directory (the repo root), so logs and cache always land in the repo, whatever the cwd. The log file is opened when the `mnemo` package is imported, so **every invocation, even `--help`, creates a `logs/mnemo_log_*` file**. Delete the ones your own test runs create.
 
 ## Destination handling (shared)
 
@@ -69,8 +75,20 @@ It copies each source to `DEST/<basename of source>`, keeping only one copy of e
 
 On `q`, only the choices made so far in the current source are copied, without its singles, and the remaining sources aren't processed. At the end, for every source processed, it logs the size of the source and of `DEST/<basename>` (`n/a` if missing, e.g. in dry-run). The final elapsed-time line ends with `, spared space: X`, the sum of source minus copy over all processed sources. Sizes are measured with `du -s --block-size=1` (`du_bytes()`) and formatted by `human_size()`, which matches `du -h` output (1024-based, rounded up, one decimal below 10). That way the spared figure is exact, not a difference of rounded strings. Nothing in the sources is ever modified.
 
+## How `stt()` works
+
+`--stt` never touches the destination. It writes `FILE.txt` (the full name plus `.txt`) next to every `.m4a`/`.aac`/`.amr` file under each source, matching the extension case-insensitively. Files whose `.txt` exists are skipped, which makes runs resumable.
+
+1. `main()` calls `ensure_stt_runtime()` right after parsing, before anything is logged, unless it's a dry run. That re-execs the script with `.venv/bin/python` and `LD_LIBRARY_PATH` set to the venv's `site-packages/nvidia/*/lib` dirs, since the loader only reads that variable at process start. `MNEMO_STT_REEXEC=1` prevents a loop. The parent's log file, still empty, is deleted first, so each run leaves a single log. A dry run doesn't need the venv: it only lists files.
+2. All `MNEMO_*` settings are read through `get_env()` before the model loads, so a bad value fails fast. The defaults are documented in the README.
+3. `load_whisper_model()` resolves `MNEMO_DEVICE=auto` with `ctranslate2.get_cuda_device_count()`. If the requested compute type isn't in `get_supported_compute_types(device)`, it takes the first supported one from `STT_COMPUTE_FALLBACK`. On the user's Pascal GPU, `float16` isn't supported, so this gives `int8_float32`. Missing CUDA libraries only show up at inference time, so the GPU model transcribes one second of silence as a warm-up. Any exception there rebuilds the model on CPU.
+4. One `WhisperModel` with `num_workers=N` is shared by a `ThreadPoolExecutor` of N threads, which is faster-whisper's supported way of running transcriptions concurrently. Each transcript goes to a hidden `.FILE.txt.*.part` temp file in the same directory and is `os.replace`d into place. On Ctrl-C the pending futures are cancelled, the in-flight temp files removed, and the process ends with `os._exit(1)`, because the worker threads are stuck in native code.
+
+Pins: `av<19` because PyAV 19 removed the `metadata_errors` argument that faster-whisper 1.2.1 passes to `av.open()`, and Python 3.12 because the system Python (3.14) is ahead of faster-whisper's native wheels.
+
 ## Conventions
 
+- Python follows PEP 8 with a 120-character line limit. Check with `uvx pycodestyle --max-line-length=120 mnemo/` (and `uvx pyflakes mnemo/`); both must be clean. Wrap long log messages and help strings with implicit string concatenation, and long calls with aligned continuation lines.
 - Output goes through the module `logger`, which writes to both stdout and `logs/mnemo_log_*`. Use `print` only for raw listings (such as `--verbose` file lists) and prompt feedback.
 - Fatal conditions use `logger.error(...)` followed by `sys.exit(1)`. Interactive prompts catch `KeyboardInterrupt` and exit cleanly.
 - External commands are passed as argument lists to `subprocess.run`. The exceptions are `find_heavy` and `find_crowded`, which use `shell=True` pipelines and quote the path with `list2cmdline`.

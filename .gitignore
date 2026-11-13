@@ -4,3 +4,5 @@ whitelist.txt
 logs/
 .cache/
 __pycache__/
+.venv/
+.idea/

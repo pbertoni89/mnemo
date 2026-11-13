@@ -9,89 +9,24 @@ import time
 import tempfile
 import json
 import csv
-import math
-import hashlib
 from collections import defaultdict
+from dataclasses import dataclass, asdict
 
-# Set up global directories
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-LOGS_DIR = os.path.join(DATA_DIR, "logs")
-CACHE_DIR = os.path.join(DATA_DIR, ".cache")
-DATE_SUFFIX = time.strftime("%Y%m%d-%H%M%S")
-
-# Configure logger to tee to both stdout and a date-stamped file
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-formatter = logging.Formatter('%(asctime)s - %(levelname)s: %(message)s', datefmt='%H:%M:%S')
-
-stdout_handler = logging.StreamHandler(sys.stdout)
-stdout_handler.setFormatter(formatter)
-logger.addHandler(stdout_handler)
-
-try:
-    os.makedirs(LOGS_DIR, exist_ok=True)
-    main_log_file = os.path.join(LOGS_DIR, f"mnemo_log_{DATE_SUFFIX}.log")
-    file_handler = logging.FileHandler(main_log_file)
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-except Exception as e:
-    logger.warning(f"Failed to set up file logger in {LOGS_DIR}: {e}")
-
-
-def format_elapsed(start_time):
-    """Helper to format elapsed time in hours, minutes, seconds."""
-    elapsed = int(time.time() - start_time)
-    hours, remainder = divmod(elapsed, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    return f"{hours:02d}h {minutes:02d}m {seconds:02d}s"
-
-
-def get_mountpoint(path):
-    """Find the mountpoint of a given path."""
-    path = os.path.abspath(path)
-    while not os.path.ismount(path):
-        path = os.path.dirname(path)
-    return path
-
-
-def get_directory_size(sources, exclude_list=None, blacklist_path=None):
-    """Precompute total required size for the given sources using du, respecting exclusions."""
-    cmd = ["du", "-scb"]
-
-    if exclude_list:
-        for exc in exclude_list:
-            cmd.append(f"--exclude={exc}")
-
-    if blacklist_path:
-        cmd.append(f"--exclude-from={blacklist_path}")
-
-    cmd.extend(sources)
-    result = subprocess.run(cmd, capture_output=True, text=True)
-
-    if result.stderr:
-        for line in result.stderr.strip().split('\n'):
-            logger.warning(f"Size calculation skipped some items: {line}")
-
-    if not result.stdout.strip():
-        logger.error("Failed to calculate sizes: no output from du.")
-        return 0
-
-    try:
-        lines = result.stdout.strip().split('\n')
-        total_line = lines[-1]
-        if 'total' in total_line:
-            return int(total_line.split()[0])
-    except Exception as e:
-        logger.error(f"Failed to parse du output: {e}")
-
-    return 0
+# Run as a script, Python puts mnemo/ on sys.path, not the repo root: add it to import the package
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from mnemo import (  # noqa: E402
+    DATA_DIR, LOGS_DIR, CACHE_DIR, DATE_SUFFIX, logger,
+    get_env, parse_bool, format_elapsed, get_mountpoint, is_within,
+    get_directory_size, du_bytes, human_size, md5_file,
+)
 
 
 def find_heavy(limit=10, directory="."):
     """Prints the first `limit` heavier files under `directory`."""
     start_time = time.time()
     logger.info(f"--- Top {limit} heaviest files in {directory} ---")
-    cmd = f"find {subprocess.list2cmdline([directory])} -type f -exec du -h {{}} + 2>/dev/null | sort -rh | head -n {limit}"
+    cmd = (f"find {subprocess.list2cmdline([directory])} -type f -exec du -h {{}} + 2>/dev/null"
+           f" | sort -rh | head -n {limit}")
     subprocess.run(cmd, shell=True)
     logger.info(f"find_heavy elapsed time: {format_elapsed(start_time)}")
 
@@ -100,15 +35,11 @@ def find_crowded(limit=10, directory="."):
     """Prints the first `limit` directories with the most files under `directory`."""
     start_time = time.time()
     logger.info(f"--- Top {limit} most crowded directories in {directory} ---")
-    cmd = f"find {subprocess.list2cmdline([directory])} -type d -exec sh -c 'echo \"$(find \"$1\" -maxdepth 1 -type f 2>/dev/null | wc -l) $1\"' _ {{}} \\; 2>/dev/null | sort -rn | head -n {limit}"
+    cmd = (f"find {subprocess.list2cmdline([directory])} -type d"
+           " -exec sh -c 'echo \"$(find \"$1\" -maxdepth 1 -type f 2>/dev/null | wc -l) $1\"' _ {} \\;"
+           f" 2>/dev/null | sort -rn | head -n {limit}")
     subprocess.run(cmd, shell=True)
     logger.info(f"find_crowded elapsed time: {format_elapsed(start_time)}")
-
-
-def is_within(path, parent):
-    """True if `path` is `parent` or lies under it, after resolving symlinks and '..'."""
-    path, parent = os.path.realpath(path), os.path.realpath(parent)
-    return os.path.commonpath([path, parent]) == parent
 
 
 def check_destination_outside_sources(dest, sources):
@@ -133,7 +64,8 @@ def prepare_destination(dest, dry_run):
                 os.makedirs(dest, exist_ok=True)
                 logger.info(f"Created destination directory: {dest}")
             except PermissionError:
-                logger.error(f"Permission denied creating destination directory '{dest}'. Is the destination partition mounted?")
+                logger.error(f"Permission denied creating destination directory '{dest}'. "
+                             "Is the destination partition mounted?")
                 sys.exit(1)
             except OSError as e:
                 logger.error(f"Failed to create destination directory '{dest}': {e}")
@@ -141,22 +73,9 @@ def prepare_destination(dest, dry_run):
 
     mountpoint = get_mountpoint(dest if os.path.exists(dest) else os.path.dirname(dest))
     if mountpoint == '/':
-        logger.error(f"Destination mountpoint is '/'. Expected an external mount. Halting.")
+        logger.error("Destination mountpoint is '/'. Expected an external mount. Halting.")
         sys.exit(1)
     return mountpoint
-
-
-def md5_file(path, chunk_size=1024 * 1024):
-    """Return the hex md5 digest of a file, or None if it cannot be read."""
-    h = hashlib.md5()
-    try:
-        with open(path, 'rb') as f:
-            for chunk in iter(lambda: f.read(chunk_size), b''):
-                h.update(chunk)
-    except OSError as e:
-        logger.warning(f"Cannot hash {path}: {e}")
-        return None
-    return h.hexdigest()
 
 
 def find_duplicate_groups(src):
@@ -221,36 +140,6 @@ def squeeze_target(src, dest):
     return os.path.join(dest, os.path.basename(src))
 
 
-def du_bytes(path):
-    """Disk usage of `path` in bytes (du -s), or None if it can't be measured."""
-    if not os.path.exists(path):
-        return None
-    result = subprocess.run(["du", "-s", "--block-size=1", path], capture_output=True, text=True)
-    try:
-        return int(result.stdout.split()[0])
-    except (IndexError, ValueError):
-        return None
-
-
-def human_size(n):
-    """Format a byte count like du -h does (powers of 1024, rounded up, one decimal below 10)."""
-    if n is None:
-        return "n/a"
-    sign = "-" if n < 0 else ""
-    value = abs(n)
-    if value < 1024:
-        return f"{sign}{value}"
-    for unit in "KMGTPE":
-        value /= 1024
-        if value < 10:
-            value = math.ceil(value * 10) / 10
-            if value < 10:
-                return f"{sign}{value:.1f}{unit}"
-        value = math.ceil(value)
-        if value < 1024 or unit == "E":
-            return f"{sign}{value}{unit}"
-
-
 def rsync_file_list(chosen, singles, src, dest, dry_run):
     """Copy `chosen` duplicates and `singles`, both [(abs path, md5 or None)] under `src`, to dest/<basename of src>/.
 
@@ -291,7 +180,8 @@ def rsync_file_list(chosen, singles, src, dest, dry_run):
             cmd.append("--dry-run")
         cmd.extend([base.rstrip(os.sep) + "/", dest + "/"])
 
-        logger.info(f"Syncing {len(entries)} entries to {squeeze_target(src, dest)} (rsync stderr: {stderr_log_path})...")
+        logger.info(f"Syncing {len(entries)} entries to {squeeze_target(src, dest)} "
+                    f"(rsync stderr: {stderr_log_path})...")
         with open(stderr_log_path, 'a') as err_f:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err_f, text=True, errors='replace')
             for line in proc.stdout:
@@ -314,7 +204,8 @@ def rsync_file_list(chosen, singles, src, dest, dry_run):
         logger.warning(f"Copy completed with rsync warnings (code {returncode}). Check {stderr_log_path} for details.")
         return transferred
     if returncode == 11:
-        logger.error(f"Insufficient space encountered during transfer (rsync code 11). Check {stderr_log_path} for details. Halting immediately.")
+        logger.error(f"Insufficient space encountered during transfer (rsync code 11). "
+                     f"Check {stderr_log_path} for details. Halting immediately.")
     else:
         logger.error(f"Rsync failed with return code {returncode}. Check {stderr_log_path} for details.")
     sys.exit(1)
@@ -412,7 +303,8 @@ def squeeze_dups(dest_raw, sources, dry_run):
 
         # Fill in the md5 of singles that were never hashed (unique size), for the CSV.
         # Symlinks are recorded without one; unreadable files are left for rsync to report.
-        to_hash = [i for i, (path, digest) in enumerate(singles) if digest is None and os.path.isfile(path) and not os.path.islink(path)]
+        to_hash = [i for i, (path, digest) in enumerate(singles)
+                   if digest is None and os.path.isfile(path) and not os.path.islink(path)]
         if to_hash:
             logger.info(f"Hashing {len(to_hash)} non-duplicate files in {src} for the CSV record...")
             for i in to_hash:
@@ -438,10 +330,218 @@ def squeeze_dups(dest_raw, sources, dry_run):
             spared = (spared or 0) + src_size - target_size
     logger.info(f"squeeze_dups elapsed time: {format_elapsed(start_time)}, spared space: {human_size(spared)}")
     if not dry_run and copied:
-        logger.info(f"*** Reminder: Please safely unmount '{mountpoint}' before physically disconnecting the drive. ***")
+        logger.info(f"*** Reminder: Please safely unmount '{mountpoint}' "
+                    "before physically disconnecting the drive. ***")
 
 
-def backup(dest_raw, sources, exclude, dry_run, verbose, blacklist=None, permissive=False, delete_mode=False, also_repos=False, no_cache=False):
+STT_EXTENSIONS = ('.m4a', '.aac', '.amr')
+STT_VENV = os.path.normpath(os.path.join(DATA_DIR, ".venv"))
+# Preferred compute types, best first, used when the requested one isn't supported by the device
+STT_COMPUTE_FALLBACK = ("float16", "int8_float16", "int8_float32", "int8", "float32")
+
+
+def stt_cuda_lib_dirs():
+    """Directories of the CUDA/cuDNN runtime wheels installed in the stt venv, if any."""
+    import glob
+    return sorted(glob.glob(os.path.join(STT_VENV, "lib", "python*", "site-packages", "nvidia", "*", "lib")))
+
+
+def ensure_stt_runtime():
+    """Re-exec this script under the stt venv's python, with its CUDA libs on LD_LIBRARY_PATH.
+
+    faster-whisper is the only non-stdlib dependency, so it lives in REPO/.venv (built by
+    driver.sh's mnemo_stt_setup) rather than the system python. LD_LIBRARY_PATH is only read
+    at process start, hence the re-exec instead of setting it in-process. Must run before
+    anything is logged: the empty log file of this process is removed, the child opens its own.
+    """
+    venv_python = os.path.join(STT_VENV, "bin", "python")
+    if not os.path.isfile(venv_python):
+        logger.error(f"No stt environment at {STT_VENV}. Create it with: source driver.sh && mnemo_stt_setup")
+        sys.exit(1)
+    if os.environ.get("MNEMO_STT_REEXEC") == "1":
+        return  # already re-executed once, don't loop
+
+    lib_dirs = stt_cuda_lib_dirs()
+    current = [d for d in os.environ.get("LD_LIBRARY_PATH", "").split(":") if d]
+    in_venv = os.path.realpath(sys.prefix) == os.path.realpath(STT_VENV)
+    if in_venv and all(d in current for d in lib_dirs):
+        return
+
+    env = dict(os.environ, MNEMO_STT_REEXEC="1", LD_LIBRARY_PATH=":".join(lib_dirs + current))
+    for h in list(logger.handlers):
+        if isinstance(h, logging.FileHandler):
+            h.close()
+            logger.removeHandler(h)
+            try:
+                if os.path.getsize(h.baseFilename) == 0:
+                    os.remove(h.baseFilename)
+            except OSError:
+                pass
+    sys.stdout.flush()
+    os.execve(venv_python, [venv_python, os.path.abspath(__file__)] + sys.argv[1:], env)
+
+
+def stt_txt_path(audio_path):
+    return audio_path + ".txt"
+
+
+def find_audio_files(src):
+    """Every file under `src` with an STT extension (case-insensitive), sorted."""
+    found = []
+    for root, dirs, files in os.walk(src):
+        dirs.sort()
+        for name in sorted(files):
+            if name.lower().endswith(STT_EXTENSIONS):
+                found.append(os.path.join(root, name))
+    return found
+
+
+@dataclass(frozen=True)
+class WhisperSettings:
+    """The resolved WhisperModel parameters, after defaults and GPU/compute-type fallbacks."""
+    model: str
+    device: str
+    compute_type: str
+    num_workers: int
+    cpu_threads: int
+
+
+def load_whisper_model():
+    """Build the WhisperModel from MNEMO_* variables, using the GPU when possible.
+
+    Returns (model, WhisperSettings). The GPU path is validated with a short warm-up transcription,
+    because missing CUDA/cuDNN libraries only surface at inference time; on any GPU failure
+    the model is rebuilt on the CPU.
+    """
+    import ctranslate2
+    from faster_whisper import WhisperModel
+
+    cpu_count = os.cpu_count() or 1
+    model_name = get_env("MODEL", "small")
+    device = get_env("DEVICE", "auto").lower()
+    if device == "auto":
+        device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+    if device not in ("cuda", "cpu"):
+        logger.error(f"MNEMO_DEVICE must be auto, cuda or cpu, not {device!r}")
+        sys.exit(1)
+
+    def build(d):
+        requested = get_env("COMPUTE_TYPE", "float16" if d == "cuda" else "int8")
+        supported = ctranslate2.get_supported_compute_types(d)
+        compute_type = requested
+        if requested != "default" and requested not in supported:
+            compute_type = next((c for c in STT_COMPUTE_FALLBACK if c in supported), "default")
+            logger.warning(f"Compute type {requested} is not supported on {d} "
+                           f"(supported: {', '.join(sorted(supported))}), using {compute_type}")
+        num_workers = max(1, get_env("NUM_WORKERS", 2 if d == "cuda" else max(1, cpu_count // 4), int))
+        cpu_threads = get_env("CPU_THREADS", max(1, cpu_count // num_workers), int)
+        s = WhisperSettings(model_name, d, compute_type, num_workers, cpu_threads)
+        logger.info("Loading Whisper model: " + ", ".join(f"{k}={v}" for k, v in asdict(settings).items()))
+        m = WhisperModel(s.model, device=s.device, compute_type=settings.compute_type,
+                         num_workers=settings.num_workers, cpu_threads=settings.cpu_threads)
+        return m, s
+
+    if device == "cuda":
+        try:
+            model, settings = build("cuda")
+            import numpy
+            segments, _ = model.transcribe(numpy.zeros(16000, dtype=numpy.float32), language="en", beam_size=1)
+            list(segments)
+            return model, settings
+        except Exception as e:
+            logger.warning(f"GPU unusable ({e}), falling back to CPU")
+    return build("cpu")
+
+
+def stt(sources, dry_run):
+    """Write FILE.txt next to every audio FILE under the sources, transcribed with faster-whisper.
+
+    Files whose .txt already exists are skipped, so an interrupted run can be resumed. Each
+    transcript is written to a hidden temp file and renamed into place, so a .txt is never partial.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    start_time = time.time()
+    todo, already = [], 0
+    for src in sources:
+        files = find_audio_files(src)
+        pending = [f for f in files if not os.path.exists(stt_txt_path(f))]
+        already += len(files) - len(pending)
+        logger.info(f"{src}: {len(files)} audio files, {len(pending)} to transcribe")
+        todo.extend(pending)
+
+    if dry_run:
+        for f in todo:
+            logger.info(f"[DRY-RUN] Would write {stt_txt_path(f)}")
+        logger.info(f"[DRY-RUN] Would transcribe {len(todo)} files, {already} already have a .txt")
+        logger.info(f"stt elapsed time: {format_elapsed(start_time)}")
+        return
+    if not todo:
+        logger.info(f"Nothing to transcribe, {already} files already have a .txt")
+        return
+
+    language = get_env("LANGUAGE", None)
+    beam_size = get_env("BEAM_SIZE", 5, int)
+    vad_filter = get_env("VAD_FILTER", True, parse_bool)
+    model, settings = load_whisper_model()
+    logger.info(f"Transcribing {len(todo)} files: language={language or 'auto'}, "
+                f"beam_size={beam_size}, vad_filter={vad_filter}")
+
+    in_flight = set()  # temp files being written, removed on interrupt
+
+    def transcribe_one(path):
+        t0 = time.time()
+        segments, info = model.transcribe(path, language=language, beam_size=beam_size, vad_filter=vad_filter)
+        lines = [s.text.strip() for s in segments if s.text.strip()]
+        target = stt_txt_path(path)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=f".{os.path.basename(target)}.", suffix=".part")
+        in_flight.add(tmp)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + ("\n" if lines else ""))
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, target)
+        finally:
+            in_flight.discard(tmp)
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        return info.language, info.language_probability, info.duration, time.time() - t0
+
+    done = failed = 0
+    executor = ThreadPoolExecutor(max_workers=settings.num_workers)
+    try:
+        futures = {executor.submit(transcribe_one, f): f for f in todo}
+        for i, fut in enumerate(as_completed(futures), 1):
+            path = futures[fut]
+            try:
+                lang, prob, duration, took = fut.result()
+                done += 1
+                logger.info(f"[{i}/{len(todo)}] {stt_txt_path(path)} "
+                            f"({lang} {prob:.0%}, {duration:.0f}s audio in {took:.0f}s)")
+            except Exception as e:
+                failed += 1
+                logger.error(f"[{i}/{len(todo)}] Failed {path}: {e}")
+    except KeyboardInterrupt:
+        print()
+        logger.critical(f"Transcription interrupted by user after {done} files. Rerun to resume.")
+        executor.shutdown(wait=False, cancel_futures=True)
+        for tmp in list(in_flight):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        logger.info(f"stt elapsed time: {format_elapsed(start_time)}")
+        os._exit(1)  # worker threads are stuck in native code; don't wait for them
+    executor.shutdown()
+
+    logger.info(f"Transcribed {done} files, {failed} failed, {already} already had a .txt")
+    logger.info(f"stt elapsed time: {format_elapsed(start_time)}")
+    if failed:
+        sys.exit(1)
+
+
+def backup(dest_raw, sources, exclude, dry_run, verbose, blacklist=None, permissive=False, delete_mode=False,
+           also_repos=False, no_cache=False):
     """Main backup logic handling Rsync, size checks, mountpoints, and file listing."""
     start_time = time.time()
     dest = os.path.abspath(dest_raw)
@@ -555,9 +655,11 @@ def backup(dest_raw, sources, exclude, dry_run, verbose, blacklist=None, permiss
         else:
             logger.warning("Insufficient space on the destination partition (based on total source size).")
             try:
-                ans = input("Do you want to proceed with the backup anyway (assuming delta is smaller)? [y/N]: ").strip().lower()
+                ans = input("Do you want to proceed with the backup anyway (assuming delta is smaller)? "
+                            "[y/N]: ").strip().lower()
                 if ans != 'y':
-                    ans_ncdu = input("Do you want to run 'ncdu' on the heaviest source entry to investigate? [y/N]: ").strip().lower()
+                    ans_ncdu = input("Do you want to run 'ncdu' on the heaviest source entry to investigate? "
+                                     "[y/N]: ").strip().lower()
                     if ans_ncdu == 'y':
                         if shutil.which("ncdu"):
                             logger.info("Determining the heaviest source entry...")
@@ -582,7 +684,8 @@ def backup(dest_raw, sources, exclude, dry_run, verbose, blacklist=None, permiss
 
     # Deletion Mode Safety Prompt
     if delete_mode and not dry_run:
-        logger.warning("DELETE MODE ENABLED. Files at the destination not present in the sources will be permanently removed.")
+        logger.warning("DELETE MODE ENABLED. "
+                       "Files at the destination not present in the sources will be permanently removed.")
         try:
             ans = input("Are you sure you want to proceed with deletion? [y/N]: ").strip().lower()
             if ans != 'y':
@@ -616,7 +719,7 @@ def backup(dest_raw, sources, exclude, dry_run, verbose, blacklist=None, permiss
         return
 
     # Run backup
-    logger.info(f"Starting backup...")
+    logger.info("Starting backup...")
 
     stdout_log_path = os.path.join(LOGS_DIR, f"mnemo_backup_stdout_{DATE_SUFFIX}.log")
     stderr_log_path = os.path.join(LOGS_DIR, f"mnemo_backup_stderr_{DATE_SUFFIX}.log")
@@ -641,17 +744,20 @@ def backup(dest_raw, sources, exclude, dry_run, verbose, blacklist=None, permiss
 
             # 11 = Error in file I/O (e.g. ENOSPC / Disk Full)
             if backup_result.returncode == 11:
-                logger.error(f"Insufficient space encountered during transfer (rsync code 11). Check {err_f.name} for details. Halting immediately.")
+                logger.error(f"Insufficient space encountered during transfer (rsync code 11). "
+                             f"Check {err_f.name} for details. Halting immediately.")
                 sys.exit(1)
 
             # Codes 23 and 24 are partial transfers due to permissions or vanished files
             elif backup_result.returncode in (0, 23, 24):
                 if backup_result.returncode != 0:
-                    logger.warning(f"Backup completed with rsync warnings (code {backup_result.returncode}). Check {err_f.name} for details.")
+                    logger.warning(f"Backup completed with rsync warnings (code {backup_result.returncode}). "
+                                   f"Check {err_f.name} for details.")
                 else:
                     logger.info("Backup completed successfully.")
             else:
-                logger.error(f"Rsync failed with return code {backup_result.returncode}. Check {err_f.name} for details.")
+                logger.error(f"Rsync failed with return code {backup_result.returncode}. "
+                             f"Check {err_f.name} for details.")
                 sys.exit(1)
     except KeyboardInterrupt:
         print()
@@ -665,7 +771,8 @@ def backup(dest_raw, sources, exclude, dry_run, verbose, blacklist=None, permiss
             tail_proc.terminate()
             tail_proc.wait()
         logger.info(f"backup elapsed time: {format_elapsed(start_time)}")
-        logger.info(f"*** Reminder: Please safely unmount '{mountpoint}' before physically disconnecting the drive. ***")
+        logger.info(f"*** Reminder: Please safely unmount '{mountpoint}' "
+                    "before physically disconnecting the drive. ***")
 
 
 def main(args=None):
@@ -674,23 +781,38 @@ def main(args=None):
     # Mutually exclusive group for the main operational modes
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--backup", action="store_true", help="Run the gradual backup process")
-    group.add_argument("--heavy", type=int, nargs='?', const=10, metavar='N', help="Find the N heaviest files in the sources")
-    group.add_argument("--crowded", type=int, nargs='?', const=10, metavar='N', help="Find the N most crowded directories in the sources")
-    group.add_argument("--squeeze-dups", action="store_true", help="Copy each source to the destination, keeping one interactively chosen copy of each set of identical files")
+    group.add_argument("--heavy", type=int, nargs='?', const=10, metavar='N',
+                       help="Find the N heaviest files in the sources")
+    group.add_argument("--crowded", type=int, nargs='?', const=10, metavar='N',
+                       help="Find the N most crowded directories in the sources")
+    group.add_argument("--squeeze-dups", action="store_true",
+                       help="Copy each source to the destination, "
+                            "keeping one interactively chosen copy of each set of identical files")
+    group.add_argument("--stt", action="store_true",
+                       help="Speech-to-text: write FILE.txt next to every .m4a/.aac/.amr FILE in the sources "
+                            "(ignores --destination; settings via MNEMO_* env vars)")
 
-    parser.add_argument("--destination", default="/run/media/pbertoni/storage/pb-backup/", help="Destination directory (USB mount expected)")
+    parser.add_argument("--destination", default="/run/media/pbertoni/storage/pb-backup/",
+                        help="Destination directory (USB mount expected)")
     parser.add_argument("--source", nargs='*', default=[], help="Directories to backup/analyze")
     parser.add_argument("--whitelist", help="Path to a file containing source directories")
     parser.add_argument("--exclude", nargs='*', default=[], help="Patterns to exclude")
     parser.add_argument("--blacklist", help="Path to a file containing exclusion patterns for rsync")
-    parser.add_argument("--permissive", action="store_true", help="Skip sufficient space checks and prompt for continuation")
+    parser.add_argument("--permissive", action="store_true",
+                        help="Skip sufficient space checks and prompt for continuation")
     parser.add_argument("--delete", action="store_true", help="Enable rsync deletion mode")
     parser.add_argument("--also-repos", action="store_true", help="Do not automatically exclude git repositories")
-    parser.add_argument("--no-cache", action="store_true", help="Disable caching of scanned results (like git repositories)")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Print selected files to stdout instead of a temp file")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Disable caching of scanned results (like git repositories)")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Print selected files to stdout instead of a temp file")
     parser.add_argument("--dry-run", action="store_true", help="Print actions and exit")
 
     parsed_args = parser.parse_args(args)
+
+    # Must happen before anything is logged, as it may re-exec this script under the stt venv
+    if parsed_args.stt and not parsed_args.dry_run:
+        ensure_stt_runtime()
 
     raw_sources = parsed_args.source[:]
 
@@ -708,7 +830,8 @@ def main(args=None):
                     raw_sources.append(line)
 
     if not raw_sources:
-        logger.error("No source directories provided. You must specify --source or provide a non-empty --whitelist file.")
+        logger.error("No source directories provided. "
+                     "You must specify --source or provide a non-empty --whitelist file.")
         sys.exit(1)
 
     sources = [os.path.abspath(src) for src in raw_sources]
@@ -728,6 +851,10 @@ def main(args=None):
     if parsed_args.crowded is not None:
         for src in sources:
             find_crowded(parsed_args.crowded, src)
+        sys.exit(0)
+
+    if parsed_args.stt:
+        stt(sources, parsed_args.dry_run)
         sys.exit(0)
 
     if parsed_args.squeeze_dups:

@@ -4,11 +4,13 @@ A small backup helper for Linux. It copies the directories you care about onto a
 
 - **Incremental**: only new or changed files are copied, so the second run is much faster than the first.
 - **Safe by default**: it refuses to write anywhere that isn't a separate mount or that lies inside a folder being backed up, checks free space before starting, asks before deleting anything, and has `--dry-run` for every mode.
+- **Transcripts of voice notes**: `--stt` writes a text transcript next to each audio recording, so they can be searched (see below).
 - **Readable layout**: `--backup` puts files at `DESTINATION/<their absolute path>`. For example, `/home/me/Documents/cv.pdf` ends up at `DESTINATION/home/me/Documents/cv.pdf`, so restoring a file is a plain copy. `--squeeze-dups` instead puts each source folder directly under the destination, by its own name (see below).
 
 ## Requirements
 
 - Python 3 (standard library only)
+- For `--stt` only: [uv](https://docs.astral.sh/uv/), which builds a separate environment with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (see below). An NVIDIA GPU is used if present.
 - `rsync`, plus `du`, `find` and `tail` (coreutils/findutils)
 - `ncdu` (optional), used to investigate when the destination is too small
 
@@ -52,7 +54,7 @@ source ~/opt/mnemo/driver.sh   # add this to ~/.bashrc to always have them
 ## Usage
 
 ```text
-mnemo.py (--backup | --heavy [N] | --crowded [N] | --squeeze-dups) [options]
+driver.py (--backup | --heavy [N] | --crowded [N] | --squeeze-dups | --stt) [options]
 ```
 
 Pick exactly one mode.
@@ -63,6 +65,7 @@ Pick exactly one mode.
 | `--heavy [N]` | Lists the N largest files in each source (default 10). |
 | `--crowded [N]` | Lists the N directories with the most files in each source (default 10). |
 | `--squeeze-dups` | Copies the sources to the destination, keeping only one copy of each set of identical files. You choose which copy. |
+| `--stt` | Transcribes every `.m4a`, `.aac` and `.amr` file in the sources to a `.txt` file next to it. Ignores `--destination`. |
 
 | Option | Meaning |
 |---|---|
@@ -84,7 +87,7 @@ Pick exactly one mode.
 
 ```bash
 cd ~/opt/mnemo
-./mnemo/mnemo.py --whitelist whitelist.txt --blacklist blacklist.txt --backup
+./mnemo/driver.py --whitelist whitelist.txt --blacklist blacklist.txt --backup
 ```
 
 With `driver.sh` loaded, run `mnemo_quick` from the repo root to do the same thing.
@@ -101,13 +104,13 @@ While it copies, rsync's output scrolls past. When it finishes, mnemo reminds yo
 ### See what would happen first
 
 ```bash
-./mnemo/mnemo.py --whitelist whitelist.txt --blacklist blacklist.txt --backup --dry-run
+./mnemo/driver.py --whitelist whitelist.txt --blacklist blacklist.txt --backup --dry-run
 ```
 
 ### Back up a single folder to another drive
 
 ```bash
-./mnemo/mnemo.py --backup --source ~/Pictures --destination /run/media/me/BIGDISK/backup
+./mnemo/driver.py --backup --source ~/Pictures --destination /run/media/me/BIGDISK/backup
 ```
 
 ### Make the backup an exact mirror
@@ -115,7 +118,7 @@ While it copies, rsync's output scrolls past. When it finishes, mnemo reminds yo
 This also removes files you have deleted locally:
 
 ```bash
-./mnemo/mnemo.py --whitelist whitelist.txt --blacklist blacklist.txt --backup --delete
+./mnemo/driver.py --whitelist whitelist.txt --blacklist blacklist.txt --backup --delete
 # DELETE MODE ENABLED. Files at the destination not present in the sources will be permanently removed.
 # Are you sure you want to proceed with deletion? [y/N]:
 ```
@@ -123,8 +126,8 @@ This also removes files you have deleted locally:
 ### Find out why the backup is too big
 
 ```bash
-./mnemo/mnemo.py --whitelist whitelist.txt --heavy 20     # the 20 largest files
-./mnemo/mnemo.py --whitelist whitelist.txt --crowded 20   # the 20 most crowded folders
+./mnemo/driver.py --whitelist whitelist.txt --heavy 20     # the 20 largest files
+./mnemo/driver.py --whitelist whitelist.txt --crowded 20   # the 20 most crowded folders
 ```
 
 Add the culprits to `blacklist.txt` and run the backup again. If the destination is too small, `--backup` also offers to open `ncdu` on your largest source.
@@ -134,7 +137,7 @@ Add the culprits to `blacklist.txt` and run the backup again. If the destination
 `--squeeze-dups` suits folders like `Downloads` or an old photo dump, where the same file sits in several places. It copies everything, but for each set of byte-identical files it shows you every copy and asks which one to keep:
 
 ```bash
-./mnemo/mnemo.py --squeeze-dups --source ~/Downloads --destination /run/media/me/BIGDISK/squeezed
+./mnemo/driver.py --squeeze-dups --source ~/Downloads --destination /run/media/me/BIGDISK/squeezed
 # or, with driver.sh loaded:
 mnemo_squeeze_dups ~/Downloads --destination /run/media/me/BIGDISK/squeezed
 ```
@@ -206,6 +209,55 @@ To preview the choices and the list of files that would be copied, without copyi
 ```bash
 mnemo_squeeze_dups ~/Downloads --destination /run/media/me/BIGDISK/squeezed --dry-run
 ```
+
+### Transcribe voice recordings
+
+`--stt` (speech-to-text) finds every `.m4a`, `.aac` and `.amr` file under each source, in any letter case, and writes its transcript next to it, adding `.txt` to the name: `memo.m4a` gets `memo.m4a.txt`. Nothing is copied and `--destination` is ignored.
+
+It needs faster-whisper, which is the only part of mnemo that isn't in the standard library, so it lives in its own environment in `.venv/` in the repo. Create it once, with `driver.sh` loaded:
+
+```bash
+mnemo_stt_setup         # creates .venv/ (Python 3.12, faster-whisper, CUDA libraries if there's an NVIDIA GPU)
+mnemo_stt_setup force   # deletes .venv/ and builds it again
+```
+
+Then:
+
+```bash
+mnemo_stt ~/Recordings ~/Phone/Voice --dry-run   # list the files that would be transcribed
+mnemo_stt ~/Recordings ~/Phone/Voice
+# or: ./mnemo/driver.py --stt --source ~/Recordings ~/Phone/Voice
+```
+
+You can run `mnemo/driver.py` with the system Python: for `--stt`, it restarts itself inside `.venv/`. The first run downloads the Whisper model into `~/.cache/huggingface`.
+
+```text
+Loading Whisper model: model=small, device=cuda, compute_type=int8_float32, num_workers=2, cpu_threads=4
+Transcribing 3 files: language=auto, beam_size=5, vad_filter=True
+[1/3] /home/me/Recordings/sub/ciao.aac.txt (it 91%, 3s audio in 2s)
+[2/3] /home/me/Recordings/memo.m4a.txt (en 96%, 4s audio in 3s)
+```
+
+Things to know:
+
+- Several files are transcribed in parallel (see `MNEMO_NUM_WORKERS`). Lines appear in the order files finish.
+- Files that already have a `.txt` are skipped, so if you stop a run with Ctrl-C, running it again picks up where it stopped. To transcribe a file again, delete its `.txt`.
+- A `.txt` is never left half-written: each transcript is written to a hidden temporary file and renamed when complete.
+- If the GPU can't be used (no CUDA libraries, unsupported compute type, out of memory at load), mnemo says so and continues on the CPU.
+- A file that fails to transcribe is logged and the others go on. The run then exits with status 1.
+
+Settings come from environment variables, for example `MNEMO_MODEL=medium MNEMO_LANGUAGE=it mnemo_stt ~/Recordings`:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MNEMO_MODEL` | `small` | Whisper model name (`tiny`, `base`, `small`, `medium`, `large-v3`, …) or path. |
+| `MNEMO_DEVICE` | `auto` | `cuda`, `cpu`, or `auto` (the GPU if there is one). |
+| `MNEMO_COMPUTE_TYPE` | `float16` on GPU, `int8` on CPU | If the device doesn't support it, the best supported type is used instead, with a warning. Older GPUs (before compute capability 7.0, such as Pascal cards) have no efficient `float16` and get `int8_float32`. |
+| `MNEMO_NUM_WORKERS` | 2 on GPU, CPU cores / 4 on CPU | Files transcribed at the same time. On GPU each one needs extra video memory. |
+| `MNEMO_CPU_THREADS` | CPU cores / workers | Threads per worker. |
+| `MNEMO_LANGUAGE` | detected per file | Language code, such as `en` or `it`. Setting it skips detection. |
+| `MNEMO_BEAM_SIZE` | `5` | Beam search width. `1` is faster and a bit less accurate. |
+| `MNEMO_VAD_FILTER` | `true` | Skip silences before transcribing. This avoids invented text during long pauses. |
 
 ## Logs
 
