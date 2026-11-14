@@ -1,6 +1,7 @@
 """Shared plumbing for mnemo: repo paths, the tee logger, and small generic helpers.
 
-driver.py holds the modes (--backup, --squeeze-dups, --stt, ...) and imports from here.
+Each mode has its own module (backup, heavy, crowded, squeeze_dups, stt), all importing from here;
+driver.py is the command line.
 """
 import os
 import sys
@@ -191,3 +192,39 @@ def md5_file(path, chunk_size=1024 * 1024):
         logger.warning(f"Cannot hash {path}: {e}")
         return None
     return h.hexdigest()
+
+
+def check_destination_outside_sources(dest, sources):
+    """Halt if the destination is one of the sources or lies inside one of them.
+
+    Otherwise each run would copy the destination into itself (and --delete could
+    remove files from the source).
+    """
+    for src in sources:
+        if is_within(dest, src):
+            logger.error(f"Destination {dest} is inside source {src}: it would be copied into itself. Halting.")
+            sys.exit(1)
+
+
+def prepare_destination(dest, dry_run):
+    """Create the destination if needed and return its mountpoint, halting if it is '/'."""
+    if not os.path.exists(dest):
+        if dry_run:
+            logger.info(f"[DRY-RUN] Would create destination directory: {dest}")
+        else:
+            try:
+                os.makedirs(dest, exist_ok=True)
+                logger.info(f"Created destination directory: {dest}")
+            except PermissionError:
+                logger.error(f"Permission denied creating destination directory '{dest}'. "
+                             "Is the destination partition mounted?")
+                sys.exit(1)
+            except OSError as e:
+                logger.error(f"Failed to create destination directory '{dest}': {e}")
+                sys.exit(1)
+
+    mountpoint = get_mountpoint(dest if os.path.exists(dest) else os.path.dirname(dest))
+    if mountpoint == '/':
+        logger.error("Destination mountpoint is '/'. Expected an external mount. Halting.")
+        sys.exit(1)
+    return mountpoint

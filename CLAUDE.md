@@ -6,7 +6,29 @@ This file guides Claude Code (claude.ai/code) when working in this repository.
 
 `mnemo` is a personal backup tool: a Python 3 CLI (`mnemo/driver.py`) that wraps `rsync` to copy a set of source directories onto an external drive in increments. It has no dependencies beyond the standard library and the system tools `rsync`, `du`, `find`, `tail` and `ncdu` (optional). The one exception is `--stt`, which needs faster-whisper from the uv venv in `.venv/` (see below). There is no build step, test suite or linter config.
 
-The code is in two files. `mnemo/driver.py` is the executable: the modes, their helpers and `main()`. `mnemo/__init__.py` holds the shared plumbing that isn't specific to one mode: the repo paths (`DATA_DIR`, `LOGS_DIR`, `CACHE_DIR`, `DATE_SUFFIX`), the tee `logger`, the prompt helpers (`ask`, `ask_yes_no`, `ask_number`), and generic helpers (`get_env`, `parse_bool`, `format_elapsed`, `get_mountpoint`, `is_within`, `get_directory_size`, `du_bytes`, `human_size`, `md5_file`). `driver.py` puts the repo root on `sys.path` and imports these names from the package, because when it runs as a script Python only adds `mnemo/` to the path. Put new generic helpers in `__init__.py` and keep `driver.py` for feature code.
+The code is the `mnemo/` package, one module per mode, plus a small command line:
+
+| File | Contents |
+|---|---|
+| `mnemo/driver.py` | The executable: argparse, source/whitelist resolution, and dispatch to the modes (`main()`). |
+| `mnemo/backup.py` | `--backup`: `backup()`. |
+| `mnemo/heavy.py` | `--heavy`: `find_heavy()`. |
+| `mnemo/crowded.py` | `--crowded`: `find_crowded()`. |
+| `mnemo/squeeze_dups.py` | `--squeeze-dups`: duplicate scan, group prompting, mode 1 (move to `mnemo-thrash`) and mode 2 (rsync copy). |
+| `mnemo/stt.py` | `--stt`: the venv re-exec, Whisper model loading and the transcription pool. |
+| `mnemo/__init__.py` | Shared plumbing. |
+
+`__init__.py` contains:
+- the repo paths (`DATA_DIR`, `LOGS_DIR`, `CACHE_DIR`, `DATE_SUFFIX`) and the tee `logger`;
+- the prompt helpers (`ask`, `ask_yes_no`, `ask_number`);
+- the destination helpers used by more than one mode (`check_destination_outside_sources`, `prepare_destination`);
+- generic helpers (`get_env`, `parse_bool`, `format_elapsed`, `get_mountpoint`, `is_within`, `get_directory_size`, `du_bytes`, `human_size`, `md5_file`).
+
+Mode modules import from the package with absolute imports (`from mnemo import …`). `driver.py` runs as a script, so Python puts `mnemo/` first on `sys.path`. `driver.py` replaces that entry with the repo root, which makes `import mnemo` work and stops `mnemo/*.py` from shadowing other top-level modules.
+
+New code goes in the module of its mode. Helpers used by more than one mode go in `__init__.py`. A new mode gets a new module and a dispatch branch in `driver.py`.
+
+`stt.py` must only import faster-whisper, ctranslate2 and numpy inside functions: `driver.py` imports every mode module at start-up under the system Python, where those packages don't exist. `ensure_stt_runtime(script)` takes `driver.py`'s path from `main()`, because it re-execs the command-line script, not `stt.py`.
 
 `README.md` is the user-facing documentation. Keep it in sync when you change flags, prompts or behaviour.
 
@@ -31,7 +53,7 @@ The code is in two files. `mnemo/driver.py` is the executable: the modes, their 
 ./mnemo/driver.py --stt --source DIR [DIR...] [--dry-run]
 ```
 
-The modes `--backup`, `--heavy`, `--crowded`, `--squeeze-dups` and `--stt` are mutually exclusive, and exactly one is required. Sources come from `--source` and/or `--whitelist`; `main()` makes them absolute and checks they exist.
+The modes `--backup`, `--heavy`, `--crowded`, `--squeeze-dups` and `--stt` are mutually exclusive, and exactly one is required. Sources come from `--source` and/or `--whitelist`; `main()` in `driver.py` makes them absolute and checks they exist.
 
 `driver.sh` is meant to be `source`d, not executed. `mnemo_old_stuff_ignore_yet_keep_me` is a legacy full-system `tar` backup that the user wants kept; don't delete or "clean up" it.
 
@@ -97,7 +119,7 @@ On `q`, only the choices made so far in the current source are copied, without i
 
 `--stt` never touches the destination. It writes `FILE.txt` (the full name plus `.txt`) next to every `.m4a`/`.aac`/`.amr` file under each source, matching the extension case-insensitively. Files whose `.txt` exists are skipped, which makes runs resumable.
 
-1. `main()` calls `ensure_stt_runtime()` right after parsing, before anything is logged, unless it's a dry run. That re-execs the script with `.venv/bin/python` and `LD_LIBRARY_PATH` set to the venv's `site-packages/nvidia/*/lib` dirs, since the loader only reads that variable at process start. `MNEMO_STT_REEXEC=1` prevents a loop. The parent's log file, still empty, is deleted first, so each run leaves a single log. A dry run doesn't need the venv: it only lists files.
+1. `main()` calls `ensure_stt_runtime(script)` with its own path right after parsing, before anything is logged, unless it's a dry run. That re-execs `driver.py` with `.venv/bin/python` and `LD_LIBRARY_PATH` set to the venv's `site-packages/nvidia/*/lib` dirs, since the loader only reads that variable at process start. `MNEMO_STT_REEXEC=1` prevents a loop. The parent's log file, still empty, is deleted first, so each run leaves a single log. A dry run doesn't need the venv: it only lists files.
 2. All `MNEMO_*` settings are read through `get_env()` before the model loads, so a bad value fails fast. The defaults are documented in the README.
 3. `load_whisper_model()` resolves `MNEMO_DEVICE=auto` with `ctranslate2.get_cuda_device_count()`. If the requested compute type isn't in `get_supported_compute_types(device)`, it takes the first supported one from `STT_COMPUTE_FALLBACK`. On the user's Pascal GPU, `float16` isn't supported, so this gives `int8_float32`. Missing CUDA libraries only show up at inference time, so the GPU model transcribes one second of silence as a warm-up. Any exception there rebuilds the model on CPU.
 4. One `WhisperModel` with `num_workers=N` is shared by a `ThreadPoolExecutor` of N threads, which is faster-whisper's supported way of running transcriptions concurrently. Each transcript goes to a hidden `.FILE.txt.*.part` temp file in the same directory and is `os.replace`d into place. On Ctrl-C the pending futures are cancelled, the in-flight temp files removed, and the process ends with `os._exit(1)`, because the worker threads are stuck in native code.
