@@ -256,6 +256,24 @@ def squeeze_dups(dest_raw, sources, dry_run):
             logger.error(f"Source {src} would be copied to {target}, which overlaps it. Halting.")
             sys.exit(1)
 
+    # The default destination is easy to forget, so confirm it before creating or reading anything.
+    # A dry run writes nothing, so it only states where the output would go.
+    targets = ", ".join(squeeze_target(src, dest) for src in sources)
+    plural = "directories" if len(sources) > 1 else "directory"
+    if dry_run:
+        logger.info(f"[DRY-RUN] Output {plural} would be {targets}")
+    else:
+        try:
+            ans = input(f"Ready to squeeze duplicates. Output {plural} will be {targets}. "
+                        "Proceed? [y/N]: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            ans = ""
+        if ans != 'y':
+            logger.info("Aborted by user.")
+            sys.exit(1)
+        logger.info(f"Output {plural}: {targets}")
+
     mountpoint = prepare_destination(dest, dry_run)
 
     sticky = None  # 'a' or 'b' once the user picks "always first/last"

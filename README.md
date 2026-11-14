@@ -152,6 +152,14 @@ mnemo_squeeze_dups . --destination ../dumps-squeezed-audio
 
 Because of this, two sources can't share a name (for example `~/a/photos` and `~/b/photos`). mnemo refuses to start rather than mix them. It also refuses a destination that would land on the source itself, such as `--source /x/foo --destination /x`.
 
+Before doing anything, mnemo shows where the output will go and waits for confirmation. This is handy when you forget `--destination` and would otherwise get the default:
+
+```text
+Ready to squeeze duplicates. Output directory will be /run/media/pbertoni/storage/pb-backup/Downloads. Proceed? [y/N]:
+```
+
+Anything other than `y` (including just pressing Enter) stops without creating or copying anything. With `--dry-run` there's no question; the output folder is only printed.
+
 ```text
 --- Duplicate group 1/2: md5 b1946ac92492d2347c6235b4d2611184, 6 bytes each ---
   1) /home/me/Downloads/baz/gem.txt
@@ -285,3 +293,9 @@ watch ls -lh ~/opt/mnemo/logs/mnemo_backup_*
 - **"Source … would be copied to …, which overlaps it"** (`--squeeze-dups`): the source would be copied onto itself, usually because `--destination` is the source's parent folder. Use a different destination.
 - **A new git repository is still being backed up, or an old one skipped**: the list of repositories is cached in `.cache/cache.json`. Delete that file to rescan, or use `--no-cache` for a single run.
 - **"Backup completed with rsync warnings (code 23/24)"**: some files couldn't be read or vanished during the copy. Check the `*_stderr_*` log for details.
+
+
+## Open issues
+
+- adding new git repositories won't make them available i.e. the cache.json should always be updated to discover them
+
