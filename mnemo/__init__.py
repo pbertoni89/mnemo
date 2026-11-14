@@ -57,6 +57,44 @@ def parse_bool(raw):
     raise ValueError(raw)
 
 
+def ask(prompt, accept):
+    """Prompt until `accept(answer)` returns something other than None, and return that.
+
+    The answer is passed stripped and lowercased. Anything `accept` rejects prints a notice
+    and asks again, so a typo can never be taken as a choice. Returns None on Ctrl-C or EOF.
+    """
+    while True:
+        try:
+            raw = input(prompt)
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return None
+        value = accept(raw.strip().lower())
+        if value is not None:
+            return value
+        print(f"Invalid answer {raw.strip()!r}, please try again.")
+
+
+def ask_yes_no(prompt):
+    """Ask a [y/N] question: y/yes is True, n/no or a bare Enter (the default) is False.
+
+    Any other answer asks again. Returns None on Ctrl-C or EOF, which callers treat as no.
+    """
+    return ask(prompt, {"y": True, "yes": True, "n": False, "no": False, "": False}.get)
+
+
+def ask_number(prompt, count, letters=()):
+    """Ask for an integer in [1, count] or one of `letters`; returns the int or the letter (None on Ctrl-C/EOF)."""
+    def accept(answer):
+        if answer in letters:
+            return answer
+        # isdecimal(), not isdigit(): int() rejects digits like '²' that isdigit() accepts
+        if answer.isdecimal() and 1 <= int(answer) <= count:
+            return int(answer)
+        return None
+    return ask(prompt, accept)
+
+
 def format_elapsed(start_time):
     """Helper to format elapsed time in hours, minutes, seconds."""
     elapsed = int(time.time() - start_time)

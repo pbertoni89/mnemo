@@ -7,6 +7,7 @@ import shutil
 import logging
 import time
 import tempfile
+import errno
 import json
 import csv
 from collections import defaultdict
@@ -18,6 +19,7 @@ from mnemo import (  # noqa: E402
     DATA_DIR, LOGS_DIR, CACHE_DIR, DATE_SUFFIX, logger,
     get_env, parse_bool, format_elapsed, get_mountpoint, is_within,
     get_directory_size, du_bytes, human_size, md5_file,
+    ask_yes_no, ask_number,
 )
 
 
@@ -211,29 +213,223 @@ def rsync_file_list(chosen, singles, src, dest, dry_run):
     sys.exit(1)
 
 
-def prompt_dup_choice(count):
-    """Ask which duplicate to save. Returns an int in [1, count], or 'a', 'b', 's' or 'q'."""
-    while True:
+def choose_from_groups(groups, sticky):
+    """Show each duplicate group and ask which copy to keep.
+
+    Answers: N keeps that copy; a/b keep the first/last copy of this and every later group
+    (sticky, no more prompts); s skips the group; q (or Ctrl-C/EOF) stops asking.
+    `sticky` carries a previous a/b across sources.
+    Returns (picks, skipped, sticky, quit_requested), where picks is [(digest, paths, kept_path)].
+    """
+    picks = []
+    skipped = 0
+    for i, (digest, paths) in enumerate(groups, 1):
+        size = os.path.getsize(paths[0])
+        logger.info(f"--- Duplicate group {i}/{len(groups)}: md5 {digest}, {size} bytes each ---")
+        for n, path in enumerate(paths, 1):
+            logger.info(f"  {n}) {path}")
+
+        if sticky:
+            choice = 1 if sticky == 'a' else len(paths)
+        else:
+            ans = ask_number(f"Save which one? [1-{len(paths)}], a=always first, b=always last, s=skip, q=quit: ",
+                             len(paths), letters=('a', 'b', 's', 'q'))
+            if ans is None or ans == 'q':
+                return picks, skipped, sticky, True
+            if ans == 's':
+                skipped += 1
+                logger.info("Skipped.")
+                continue
+            if ans in ('a', 'b'):
+                sticky = ans
+                choice = 1 if ans == 'a' else len(paths)
+            else:
+                choice = ans
+
+        kept = paths[choice - 1]
+        picks.append((digest, paths, kept))
+        logger.info(f"Selected {kept}")
+    return picks, skipped, sticky, False
+
+
+SQUEEZE_MOVE, SQUEEZE_MERGE = 1, 2
+SQUEEZE_TRASH_DIR = "mnemo-trash"
+
+
+def ask_squeeze_mode():
+    """Ask whether to move discarded duplicates out of the sources or copy a squeezed tree to the destination."""
+    print("How do you want to squeeze duplicates?\n"
+          f"  1) Just remove the discarded ones (moved out of the sources into DEST/<source name>/{SQUEEZE_TRASH_DIR}, "
+          "nothing else is copied)\n"
+          "  2) Squeeze and merge inside destination (the sources are left untouched)")
+    mode = ask_number("Choice [1-2]: ", 2)
+    if mode is None:
+        logger.info("Aborted by user.")
+        sys.exit(1)
+    return mode
+
+
+def trash_dir(src, dest):
+    """Where mode 1 moves the discarded duplicates of `src`: dest/<basename of src>/mnemo-thrash."""
+    return os.path.join(squeeze_target(src, dest), SQUEEZE_TRASH_DIR)
+
+
+def free_trash_path(path):
+    """`path`, or `path~1`, `path~2`, ... if it is already taken (never overwrite an earlier run's trash)."""
+    candidate, n = path, 0
+    while os.path.lexists(candidate):
+        n += 1
+        candidate = f"{path}~{n}"
+    return candidate
+
+
+def move_verified(path, target, digest):
+    """Move `path` to `target`; across filesystems, copy, check the md5 of the copy, then delete the original.
+
+    Raises OSError if anything fails; the original is only removed once an identical copy is in place.
+    """
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    try:
+        os.rename(path, target)  # same filesystem: atomic, content untouched
+        return
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            raise
+    partial = f"{target}.mnemo-partial"
+    try:
+        shutil.copy2(path, partial)
+        if md5_file(partial) != digest:
+            raise OSError(f"the copy at {partial} does not match md5 {digest} (did the file change since the scan?)")
+        os.replace(partial, target)
+    except BaseException:
+        if os.path.exists(partial):
+            os.remove(partial)
+        raise
+    os.remove(path)
+
+
+def move_discarded(moves, src, dest, dry_run):
+    """Move each discarded duplicate of `src` to dest/<basename>/mnemo-thrash/<path relative to src>.
+
+    `moves` is [(discarded_path, kept_path, digest)]. Every move is recorded in
+    logs/mnemo_squeeze_dups_moved_<date>.csv (moved_path,trash_path,kept_path,md5sum).
+    Returns (moved_count, moved_bytes).
+    """
+    csv_path = os.path.join(LOGS_DIR, f"mnemo_squeeze_dups_moved_{DATE_SUFFIX}.csv")
+    trash = trash_dir(src, dest)
+    moved = 0
+    moved_bytes = 0
+    verified_kept = {}  # kept path -> whether it still has the expected md5 (hash each kept copy once)
+
+    for discarded, kept, digest in moves:
+        target = os.path.join(trash, os.path.relpath(discarded, src))
+        if dry_run:
+            logger.info(f"[DRY-RUN] Would move: {discarded} -> {target} (keeping {kept})")
+            moved += 1
+            moved_bytes += os.path.getsize(discarded)
+            continue
+
+        # The files were hashed during the scan: if the kept copy changed since, it no longer stands in
+        # for the discarded one, so leave the discarded one where it is
+        if kept not in verified_kept:
+            verified_kept[kept] = md5_file(kept) == digest
+        if not verified_kept[kept]:
+            logger.warning(f"Not moving {discarded}: the kept copy {kept} is missing or changed since the scan.")
+            continue
         try:
-            ans = input(f"Save which one? [1-{count}], a=always first, b=always last, s=skip, q=quit: ").strip().lower()
-        except (KeyboardInterrupt, EOFError):
-            print()
-            return 'q'
-        if ans in ('a', 'b', 's', 'q'):
-            return ans
-        if ans.isdigit() and 1 <= int(ans) <= count:
-            return int(ans)
-        print(f"Invalid choice '{ans}'.")
+            if os.path.samefile(discarded, kept):
+                # A hardlink or bind-mount alias of the kept file: moving it frees nothing, and
+                # with a bind mount it would move the kept copy itself out of the source
+                logger.warning(f"Not moving {discarded}: it is the same file as {kept} (hardlink or bind mount).")
+                continue
+            target = free_trash_path(target)
+            size = os.path.getsize(discarded)
+            move_verified(discarded, target, digest)
+        except OSError as e:
+            logger.error(f"Failed to move {discarded}: {e}")
+            continue
+
+        moved += 1
+        moved_bytes += size
+        logger.info(f"Moved: {discarded} -> {target} (kept {kept})")
+        write_header = not os.path.exists(csv_path)
+        with open(csv_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow(["moved_path", "trash_path", "kept_path", "md5sum"])
+            writer.writerow([discarded, target, kept, digest])
+
+    if moved and not dry_run:
+        logger.info(f"Moves recorded in: {csv_path}")
+    return moved, moved_bytes
+
+
+def move_dups(sources, dest, dry_run, mountpoint):
+    """Mode 1 of --squeeze-dups: keep one user-chosen copy of each set of duplicates in place, and move the
+    others to dest/<basename>/mnemo-thrash, so they leave the source without being lost.
+
+    Per source: ask about every group, then move. On 'q', the choices made so far in the current
+    source are still carried out, and the remaining sources are not processed.
+    """
+    start_time = time.time()
+    sticky = None
+    moved_total = 0
+    skipped_total = 0
+    spared = 0
+    processed = []
+
+    for src in sources:
+        groups, _singles = find_duplicate_groups(src)
+        logger.info(f"Found {len(groups)} groups of duplicates in {src}")
+        picks, skipped, sticky, quit_requested = choose_from_groups(groups, sticky)
+        skipped_total += skipped
+        if quit_requested:
+            logger.info("Quit requested by user: handling only the duplicates chosen so far in this source.")
+
+        moves = [(path, kept, digest) for digest, paths, kept in picks for path in paths if path != kept]
+        if moves:
+            size_before = du_bytes(src)
+            moved, moved_bytes = move_discarded(moves, src, dest, dry_run)
+            moved_total += moved
+            if dry_run:
+                spared += moved_bytes
+            else:
+                size_after = du_bytes(src)
+                if size_before is not None and size_after is not None:
+                    spared += size_before - size_after
+                processed.append((src, size_before, size_after))
+        else:
+            logger.info(f"Nothing to move out of {src}.")
+
+        if quit_requested:
+            break
+
+    verb = "Would move" if dry_run else "Moved"
+    logger.info(f"{verb} {moved_total} files out of the sources, skipped {skipped_total} duplicate groups.")
+    if processed:
+        logger.info("--- Space used (du -sh) ---")
+        for src, before, after in processed:
+            logger.info(f"  {human_size(before):>6} -> {human_size(after):>6}  {src}")
+            trash = trash_dir(src, dest)
+            logger.info(f"  {human_size(du_bytes(trash)):>16}  {trash}")
+    spared_label = "would spare about" if dry_run else "spared space:"
+    logger.info(f"squeeze_dups elapsed time: {format_elapsed(start_time)}, {spared_label} {human_size(spared)}")
+    if not dry_run and moved_total:
+        logger.info(f"*** Reminder: Please safely unmount '{mountpoint}' "
+                    "before physically disconnecting the drive. ***")
 
 
 def squeeze_dups(dest_raw, sources, dry_run):
-    """Copy each source to dest/<basename of source>, keeping only one user-chosen copy of each set of duplicates.
+    """Keep only one user-chosen copy of each set of duplicates, in one of two modes (asked first).
 
-    Per source: ask about every duplicate group first, then copy the chosen files plus
-    every non-duplicate file in one rsync pass. On 'q', only the choices made so far
-    in the current source are copied, and the remaining sources are not processed.
-    At the end, logs the du -sh size of each processed source and of its copy.
+    1) move_dups(): move the discarded copies out of the sources into dest/<basename>/mnemo-thrash.
+    2) Copy each source to dest/<basename of source>: ask about every duplicate group first,
+       then copy the chosen files plus every non-duplicate file in one rsync pass. On 'q', only
+       the choices made so far in the current source are copied, and the remaining sources are
+       not processed. At the end, logs the du -sh size of each processed source and of its copy.
+    Both modes write under dest/<basename of source>, so they share the same checks and confirmation.
     """
+    mode = ask_squeeze_mode()
     start_time = time.time()
     dest = os.path.abspath(dest_raw)
 
@@ -244,76 +440,53 @@ def squeeze_dups(dest_raw, sources, dry_run):
     clashes = {name: srcs for name, srcs in basenames.items() if len(srcs) > 1}
     if clashes:
         for name, srcs in clashes.items():
-            logger.error(f"Sources {', '.join(srcs)} would all be copied to {os.path.join(dest, name)}.")
+            logger.error(f"Sources {', '.join(srcs)} would all be written to {os.path.join(dest, name)}.")
         logger.error("Each source must have a different basename. Halting.")
         sys.exit(1)
 
     check_destination_outside_sources(dest, sources)
-    # e.g. --source /x/foo --destination /x would copy /x/foo onto itself
+    # e.g. --source /x/foo --destination /x would write /x/foo (or /x/foo/mnemo-thrash) onto the source
     for src in sources:
         target = squeeze_target(src, dest)
         if is_within(target, src) or is_within(src, target):
-            logger.error(f"Source {src} would be copied to {target}, which overlaps it. Halting.")
+            logger.error(f"Source {src} would be written to {target}, which overlaps it. Halting.")
             sys.exit(1)
 
     # The default destination is easy to forget, so confirm it before creating or reading anything.
     # A dry run writes nothing, so it only states where the output would go.
-    targets = ", ".join(squeeze_target(src, dest) for src in sources)
-    plural = "directories" if len(sources) > 1 else "directory"
-    if dry_run:
-        logger.info(f"[DRY-RUN] Output {plural} would be {targets}")
+    if mode == SQUEEZE_MOVE:
+        dirs = [trash_dir(src, dest) for src in sources]
+        what = "Discarded copies will be moved to"
     else:
-        try:
-            ans = input(f"Ready to squeeze duplicates. Output {plural} will be {targets}. "
-                        "Proceed? [y/N]: ").strip().lower()
-        except (KeyboardInterrupt, EOFError):
-            print()
-            ans = ""
-        if ans != 'y':
+        dirs = [squeeze_target(src, dest) for src in sources]
+        what = "Output directories will be" if len(sources) > 1 else "Output directory will be"
+    targets = ", ".join(dirs)
+    if dry_run:
+        logger.info(f"[DRY-RUN] {what} {targets}")
+    else:
+        if not ask_yes_no(f"Ready to squeeze duplicates. {what} {targets}. Proceed? [y/N]: "):
             logger.info("Aborted by user.")
             sys.exit(1)
-        logger.info(f"Output {plural}: {targets}")
+        logger.info(f"{what} {targets}")
 
     mountpoint = prepare_destination(dest, dry_run)
+
+    if mode == SQUEEZE_MOVE:
+        move_dups(sources, dest, dry_run, mountpoint)
+        return
 
     sticky = None  # 'a' or 'b' once the user picks "always first/last"
     copied = 0
     skipped = 0
-    quit_requested = False
     processed = []
 
     for src in sources:
         processed.append(src)
         groups, singles = find_duplicate_groups(src)
         logger.info(f"Found {len(groups)} groups of duplicates and {len(singles)} non-duplicate entries in {src}")
-        chosen = []
-
-        for i, (digest, paths) in enumerate(groups, 1):
-            size = os.path.getsize(paths[0])
-            logger.info(f"--- Duplicate group {i}/{len(groups)}: md5 {digest}, {size} bytes each ---")
-            for n, path in enumerate(paths, 1):
-                logger.info(f"  {n}) {path}")
-
-            if sticky:
-                choice = 1 if sticky == 'a' else len(paths)
-            else:
-                ans = prompt_dup_choice(len(paths))
-                if ans == 'q':
-                    quit_requested = True
-                    break
-                if ans == 's':
-                    skipped += 1
-                    logger.info("Skipped.")
-                    continue
-                if ans in ('a', 'b'):
-                    sticky = ans
-                    choice = 1 if ans == 'a' else len(paths)
-                else:
-                    choice = ans
-
-            selected = paths[choice - 1]
-            chosen.append((selected, digest))
-            logger.info(f"Selected {selected}")
+        picks, group_skipped, sticky, quit_requested = choose_from_groups(groups, sticky)
+        skipped += group_skipped
+        chosen = [(kept, digest) for digest, _paths, kept in picks]
 
         if quit_requested:
             logger.info("Quit requested by user: copying only the duplicates chosen so far in this source.")
@@ -672,46 +845,35 @@ def backup(dest_raw, sources, exclude, dry_run, verbose, blacklist=None, permiss
             logger.info("Permissive mode active: ignoring space constraints and proceeding.")
         else:
             logger.warning("Insufficient space on the destination partition (based on total source size).")
-            try:
-                ans = input("Do you want to proceed with the backup anyway (assuming delta is smaller)? "
-                            "[y/N]: ").strip().lower()
-                if ans != 'y':
-                    ans_ncdu = input("Do you want to run 'ncdu' on the heaviest source entry to investigate? "
-                                     "[y/N]: ").strip().lower()
-                    if ans_ncdu == 'y':
-                        if shutil.which("ncdu"):
-                            logger.info("Determining the heaviest source entry...")
-                            source_sizes = []
-                            for src in sources:
-                                source_sizes.append((get_directory_size([src], exclude, blacklist_path), src))
-
-                            # Sort by size descending and pick ONLY the top 1
-                            source_sizes.sort(key=lambda x: x[0], reverse=True)
-                            heaviest_source = source_sizes[0][1]
-
-                            logger.info(f"Launching ncdu on: {heaviest_source}")
-                            subprocess.run(["ncdu", heaviest_source])
-                        else:
-                            logger.error("The 'ncdu' utility is not installed or not found in PATH.")
-                    logger.info("Halting backup process.")
-                    sys.exit(1)
-            except KeyboardInterrupt:
-                print()
+            proceed = ask_yes_no("Do you want to proceed with the backup anyway (assuming delta is smaller)? [y/N]: ")
+            if proceed is None:
                 logger.info("Prompt aborted by user.")
+                sys.exit(1)
+            if not proceed:
+                if ask_yes_no("Do you want to run 'ncdu' on the heaviest source entry to investigate? [y/N]: "):
+                    if shutil.which("ncdu"):
+                        logger.info("Determining the heaviest source entry...")
+                        source_sizes = []
+                        for src in sources:
+                            source_sizes.append((get_directory_size([src], exclude, blacklist_path), src))
+
+                        # Sort by size descending and pick ONLY the top 1
+                        source_sizes.sort(key=lambda x: x[0], reverse=True)
+                        heaviest_source = source_sizes[0][1]
+
+                        logger.info(f"Launching ncdu on: {heaviest_source}")
+                        subprocess.run(["ncdu", heaviest_source])
+                    else:
+                        logger.error("The 'ncdu' utility is not installed or not found in PATH.")
+                logger.info("Halting backup process.")
                 sys.exit(1)
 
     # Deletion Mode Safety Prompt
     if delete_mode and not dry_run:
         logger.warning("DELETE MODE ENABLED. "
                        "Files at the destination not present in the sources will be permanently removed.")
-        try:
-            ans = input("Are you sure you want to proceed with deletion? [y/N]: ").strip().lower()
-            if ans != 'y':
-                logger.info("Aborted by user.")
-                sys.exit(1)
-        except KeyboardInterrupt:
-            print()
-            logger.info("Prompt aborted by user.")
+        if not ask_yes_no("Are you sure you want to proceed with deletion? [y/N]: "):
+            logger.info("Aborted by user.")
             sys.exit(1)
 
     # Build final rsync command
@@ -804,8 +966,9 @@ def main(args=None):
     group.add_argument("--crowded", type=int, nargs='?', const=10, metavar='N',
                        help="Find the N most crowded directories in the sources")
     group.add_argument("--squeeze-dups", action="store_true",
-                       help="Copy each source to the destination, "
-                            "keeping one interactively chosen copy of each set of identical files")
+                       help="Keep one interactively chosen copy of each set of identical files: either move the "
+                            "others out of the sources into the destination, or copy a squeezed tree there "
+                            "(asked at start)")
     group.add_argument("--stt", action="store_true",
                        help="Speech-to-text: write FILE.txt next to every .m4a/.aac/.amr FILE in the sources "
                             "(ignores --destination; settings via MNEMO_* env vars)")
