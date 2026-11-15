@@ -4,7 +4,7 @@ This file guides Claude Code (claude.ai/code) when working in this repository.
 
 ## What this is
 
-`mnemo` is a personal backup tool: a Python 3 CLI (`mnemo/driver.py`) that wraps `rsync` to copy a set of source directories onto an external drive in increments. It has no dependencies beyond the standard library and the system tools `rsync`, `du`, `find`, `tail` and `ncdu` (optional). The one exception is `--stt`, which needs faster-whisper from the uv venv in `.venv/` (see below). There is no build step, test suite or linter config.
+`mnemo` is a personal backup tool: a Python 3 CLI (`mnemo/driver.py`) that wraps `rsync` to copy a set of source directories onto an external drive in increments. It has no dependencies beyond the standard library and the system tools `rsync`, `du`, `find`, `tail` and `ncdu` (optional). The one exception is `--stt`, which needs faster-whisper from the uv venv in `.venv/` (see below). There is no build step or linter config. The only test is `tests/squeeze_dups.sh`, a bash script that exercises `--squeeze-dups` on throwaway dirs in `/tmp` and exits non-zero on failure.
 
 The code is the `mnemo/` package, one module per mode, plus a small command line:
 
@@ -14,14 +14,14 @@ The code is the `mnemo/` package, one module per mode, plus a small command line
 | `mnemo/backup.py` | `--backup`: `backup()`. |
 | `mnemo/heavy.py` | `--heavy`: `find_heavy()`. |
 | `mnemo/crowded.py` | `--crowded`: `find_crowded()`. |
-| `mnemo/squeeze_dups.py` | `--squeeze-dups`: duplicate scan, group prompting, mode 1 (move to `mnemo-thrash`) and mode 2 (rsync copy). |
+| `mnemo/squeeze_dups.py` | `--squeeze-dups`: duplicate scan, group prompting, mode 1 (move to `mnemo-trash`) and mode 2 (rsync copy). |
 | `mnemo/stt.py` | `--stt`: the venv re-exec, Whisper model loading and the transcription pool. |
 | `mnemo/__init__.py` | Shared plumbing. |
 
 `__init__.py` contains:
 - the repo paths (`DATA_DIR`, `LOGS_DIR`, `CACHE_DIR`, `DATE_SUFFIX`) and the tee `logger`;
 - the prompt helpers (`ask`, `ask_yes_no`, `ask_number`);
-- the destination helpers used by more than one mode (`check_destination_outside_sources`, `prepare_destination`);
+- the destination helpers used by more than one mode (`check_destination_outside_sources`, `prepare_destination`, `remind_unmount`);
 - generic helpers (`get_env`, `parse_bool`, `format_elapsed`, `get_mountpoint`, `is_within`, `get_directory_size`, `du_bytes`, `human_size`, `md5_file`).
 
 Mode modules import from the package with absolute imports (`from mnemo import …`). `driver.py` runs as a script, so Python puts `mnemo/` first on `sys.path`. `driver.py` replaces that entry with the repo root, which makes `import mnemo` work and stops `mnemo/*.py` from shadowing other top-level modules.
@@ -47,7 +47,7 @@ New code goes in the module of its mode. Helpers used by more than one mode go i
 ./mnemo/driver.py --whitelist ./whitelist.txt --crowded 20   # dirs with the most files per source
 
 # Copy keeping one copy of each set of duplicates (driver.sh: mnemo_squeeze_dups DIR [DIR...])
-./mnemo/driver.py --squeeze-dups --source DIR [DIR...] [--dry-run]
+./mnemo/driver.py --squeeze-dups --source DIR [DIR...] [--squeeze-mode discard|merge] [--dry-run]
 
 # Transcribe audio to sibling .txt files (driver.sh: mnemo_stt DIR [DIR...]; env built by mnemo_stt_setup [force])
 ./mnemo/driver.py --stt --source DIR [DIR...] [--dry-run]
@@ -76,6 +76,8 @@ Before that, `check_destination_outside_sources()` halts if the destination equa
 
 `prepare_destination()` creates the destination if needed (it only logs in dry-run mode) and **refuses if its mountpoint is `/`**: the destination must be an external mount. The default is `/run/media/pbertoni/storage/pb-backup/`. `--backup` mirrors absolute source paths under the destination (`DEST/home/…`). `--squeeze-dups` instead puts each source at `DEST/<basename of source>/…` (`squeeze_target()`).
 
+At the end, `remind_unmount()` logs the "safely unmount" reminder only when `is_on_root_device()` is false, i.e. when the destination's mount is backed by a `/dev/…` device (read from `/proc/self/mountinfo` by `mount_source()`) other than the one behind `/`. A tmpfs such as `/tmp`, a btrfs subvolume or a bind mount on the root partition gets no reminder.
+
 ## How `backup()` works
 
 The steps run in this order, and each one matters:
@@ -89,11 +91,11 @@ The steps run in this order, and each one matters:
 
 ## How `squeeze_dups()` works
 
-`ask_squeeze_mode()` first asks for one of two modes. 1 (`SQUEEZE_MOVE`) moves the discarded copies out of the sources into the destination. 2 (`SQUEEZE_MERGE`) copies a squeezed tree to the destination. The question is asked in dry-run too. Both modes share `find_duplicate_groups()` and `choose_from_groups()`, which shows each group and returns `(picks, skipped, sticky, quit_requested)`, with picks as `[(digest, paths, kept)]`.
+There are two modes. 1 (`SQUEEZE_MOVE`, `--squeeze-mode discard`) moves the discarded copies out of the sources into the destination. 2 (`SQUEEZE_MERGE`, `--squeeze-mode merge`) copies a squeezed tree to the destination. `SQUEEZE_MODE_NAMES` maps the flag values to them; `driver.py` rejects `--squeeze-mode` without `--squeeze-dups`. Without the flag, `ask_squeeze_mode()` asks, in dry-run too, but only after the basename-clash and overlap checks, so a bad destination fails without prompting. Both modes share `find_duplicate_groups()` and `choose_from_groups()`, which shows each group and returns `(picks, skipped, sticky, quit_requested)`, with picks as `[(digest, paths, kept)]`.
 
 ### Mode 1: `move_dups()`
 
-The chosen copy stays in place; the others are moved to `trash_dir()` = `DEST/<basename>/mnemo-thrash/<path relative to src>`. Nothing is deleted outright, and nothing else is copied. Because mode 1 writes under `DEST/<basename>` like mode 2, the basename-clash check, the overlap checks, the "Proceed?" prompt (worded "Discarded copies will be moved to …/mnemo-thrash") and `prepare_destination()` all run before the branch. Free space on the destination is deliberately not checked.
+The chosen copy stays in place; the others are moved to `trash_dir()` = `DEST/<basename>/mnemo-trash/<path relative to src>`. Nothing is deleted outright, and nothing else is copied. Because mode 1 writes under `DEST/<basename>` like mode 2, the basename-clash check, the overlap checks, the "Proceed?" prompt (worded "Discarded copies will be moved to …/mnemo-trash") and `prepare_destination()` all run before the branch. Free space on the destination is deliberately not checked.
 
 For each source: ask about every group, build `[(discarded, kept, digest)]`, and call `move_discarded()`. For each file, that function:
 
@@ -102,13 +104,13 @@ For each source: ask about every group, build `[(discarded, kept, digest)]`, and
 3. picks a target with `free_trash_path()`, which appends `~N` and never overwrites;
 4. calls `move_verified()`. That tries `os.rename`. On `EXDEV`, it does `copy2` to `<target>.mnemo-partial`, checks the md5, `os.replace`s it into place, and only then removes the original. On any failure the partial is removed and the original stays.
 
-Moves are appended to `logs/mnemo_squeeze_dups_moved_*.csv` (`moved_path,trash_path,kept_path,md5sum`). On `q`, the current source's choices so far are still moved, and later sources are skipped. The summary shows source `du` before -> after and the trash size, and `spared space` is the source shrinkage. Dry-run logs `Would move` lines and `would spare about` (sum of file sizes). Empty directories are left in the source. The directory name is `mnemo-thrash` (`SQUEEZE_TRASH_DIR`), spelled as the user asked.
+Moves are appended to `logs/mnemo_squeeze_dups_moved_*.csv` (`moved_path,trash_path,kept_path,md5sum`). On `q`, the current source's choices so far are still moved, and later sources are skipped. The summary shows source `du` before -> after and the trash size, and `spared space` is the source shrinkage. Dry-run logs `Would move` lines and `would spare about` (sum of file sizes). Empty directories are left in the source. The directory name is `mnemo-trash` (`SQUEEZE_TRASH_DIR`), spelled as the user asked.
 
 ### Mode 2: copy to the destination
 
 It copies each source to `DEST/<basename of source>`, keeping only one copy of each set of identical files. It halts before doing anything if two sources share a basename, since they would merge. Each source is handled on its own; duplicates are never matched across sources. The blacklist, `--exclude` and git-repo exclusion are deliberately **not** applied here.
 
-0. After those checks, and before `prepare_destination()`, it asks `Ready to squeeze duplicates. Output directory will be … Proceed? [y/N]`, listing every `DEST/<basename>`. Only yes continues; no, Enter, Ctrl-C and EOF abort with exit 1. This exists because the user often forgets `--destination` and gets the default. Dry-run skips the prompt and only logs the output dirs. Scripted test runs must therefore feed the mode (`1` or `2`) and then `y` on stdin. Mode 1 shows the same prompt.
+0. After those checks, and before `prepare_destination()`, it asks `Ready to squeeze duplicates. Output directory will be … Proceed? [y/N]`, listing every `DEST/<basename>`. Only yes continues; no, Enter, Ctrl-C and EOF abort with exit 1. This exists because the user often forgets `--destination` and gets the default. Dry-run skips the prompt and only logs the output dirs. Scripted test runs must therefore pass `--squeeze-mode` (or feed `1`/`2` on stdin) and then feed `y`; `tests/squeeze_dups.sh` does this. Mode 1 shows the same prompt.
 1. `find_duplicate_groups()` walks the source and buckets files by size, then md5-hashes only the files whose size matches another's. It returns `(groups, singles)`. Singles are everything else: unique files, empty files, symlinks (including symlinks to directories), and unreadable files, which are left for rsync to report.
 2. For each group, the paths are listed sorted alphabetically and `choose_from_groups()` asks: `N` picks that file; `a`/`b` mean always first/always last, sticky for the rest of the run (no more prompts); `s` skips the group, so none of its files are copied; `q`, Ctrl-C or EOF quits.
 3. `rsync_file_list()` copies the chosen duplicates plus all singles in a single `rsync -a --from0 --files-from=LIST --out-format=%n <parent of src>/ DEST/` pass. LIST paths are relative to the parent of the source, so `--files-from`'s implied `--relative` recreates them as `DEST/<basename>/…`, so files already up to date are skipped and an existing target is overwritten. It reads rsync's stdout and logs one line per transferred file, tagged `chosen duplicate` or `non-duplicate`, skipping directory lines. It then logs how many entries were already up to date. Dry-run adds `--dry-run` and logs `[DRY-RUN] Would copy …` lines instead. It uses the same exit-code rules as `backup()`. LIST is a NUL-separated temp file, deleted afterwards. The readable record is the CSV, written with the `csv` module (so odd names are quoted). Before the copy, `squeeze_dups()` md5-hashes every single that is a regular file (not a symlink) and was never hashed, so the CSV `md5sum` is empty only for symlinks and unreadable files. This is a full read of the source, which is the expensive part on big trees. Singles come from `find_duplicate_groups()` as `(path, md5 or None)` pairs, and chosen duplicates are tracked as `(path, md5)`.

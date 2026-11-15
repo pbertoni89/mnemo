@@ -9,7 +9,7 @@ import time
 from mnemo import (
     CACHE_DIR, LOGS_DIR, DATE_SUFFIX, logger,
     format_elapsed, get_directory_size, ask_yes_no,
-    check_destination_outside_sources, prepare_destination,
+    check_destination_outside_sources, prepare_destination, remind_unmount,
 )
 
 
@@ -233,5 +233,4 @@ def backup(dest_raw, sources, exclude, dry_run, verbose, blacklist=None, permiss
             tail_proc.terminate()
             tail_proc.wait()
         logger.info(f"backup elapsed time: {format_elapsed(start_time)}")
-        logger.info(f"*** Reminder: Please safely unmount '{mountpoint}' "
-                    "before physically disconnecting the drive. ***")
+        remind_unmount(mountpoint)

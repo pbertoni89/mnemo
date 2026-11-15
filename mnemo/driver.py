@@ -14,7 +14,7 @@ from mnemo import logger  # noqa: E402
 from mnemo.backup import backup  # noqa: E402
 from mnemo.crowded import find_crowded  # noqa: E402
 from mnemo.heavy import find_heavy  # noqa: E402
-from mnemo.squeeze_dups import squeeze_dups  # noqa: E402
+from mnemo.squeeze_dups import SQUEEZE_MODE_NAMES, squeeze_dups  # noqa: E402
 from mnemo.stt import ensure_stt_runtime, stt  # noqa: E402
 
 
@@ -31,11 +31,14 @@ def main(args=None):
     group.add_argument("--squeeze-dups", action="store_true",
                        help="Keep one interactively chosen copy of each set of identical files: either move the "
                             "others out of the sources into the destination, or copy a squeezed tree there "
-                            "(asked at start)")
+                            "(see --squeeze-mode)")
     group.add_argument("--stt", action="store_true",
                        help="Speech-to-text: write FILE.txt next to every .m4a/.aac/.amr FILE in the sources "
                             "(ignores --destination; settings via MNEMO_* env vars)")
 
+    parser.add_argument("--squeeze-mode", choices=list(SQUEEZE_MODE_NAMES),
+                        help="With --squeeze-dups: 'discard' moves the discarded copies out of the sources into "
+                             "the destination, 'merge' copies a squeezed tree there. Asked if omitted")
     parser.add_argument("--destination", default="/run/media/pbertoni/storage/pb-backup/",
                         help="Destination directory (USB mount expected)")
     parser.add_argument("--source", nargs='*', default=[], help="Directories to backup/analyze")
@@ -53,6 +56,8 @@ def main(args=None):
     parser.add_argument("--dry-run", action="store_true", help="Print actions and exit")
 
     parsed_args = parser.parse_args(args)
+    if parsed_args.squeeze_mode and not parsed_args.squeeze_dups:
+        parser.error("--squeeze-mode requires --squeeze-dups")
 
     # Must happen before anything is logged, as it may re-exec this script under the stt venv
     if parsed_args.stt and not parsed_args.dry_run:
@@ -102,7 +107,7 @@ def main(args=None):
         sys.exit(0)
 
     if parsed_args.squeeze_dups:
-        squeeze_dups(parsed_args.destination, sources, parsed_args.dry_run)
+        squeeze_dups(parsed_args.destination, sources, parsed_args.dry_run, parsed_args.squeeze_mode)
         sys.exit(0)
 
     # Proceed with --backup logic

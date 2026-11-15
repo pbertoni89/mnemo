@@ -72,6 +72,7 @@ Pick exactly one mode.
 | `--source DIR [DIR ...]` | Directories to work on. |
 | `--whitelist FILE` | Reads the directories to work on from a file (it can be combined with `--source`). |
 | `--destination DIR` | Where to copy to. Must be on a separate mount, such as a USB drive. Default: `/run/media/pbertoni/storage/pb-backup/`. |
+| `--squeeze-mode discard\|merge` | `--squeeze-dups` only: mode 1 (`discard`) or mode 2 (`merge`), so it isn't asked. |
 | `--blacklist FILE` | `rsync` exclude patterns (`--backup` only). |
 | `--exclude PAT [PAT ...]` | Extra exclude patterns on the command line (`--backup` only). |
 | `--dry-run` | Shows what would happen without copying anything. |
@@ -101,7 +102,7 @@ Before copying, mnemo:
 3. writes the list of files it will copy to `logs/`,
 4. compares the space needed with the space free on the drive.
 
-While it copies, rsync's output scrolls past. When it finishes, mnemo reminds you to unmount the drive.
+While it copies, rsync's output scrolls past. When it finishes, mnemo reminds you to unmount the drive (unless the destination is on the same partition as `/`, or on a RAM disk like `/tmp`).
 
 ### See what would happen first
 
@@ -136,14 +137,16 @@ Add the culprits to `blacklist.txt` and run the backup again. If the destination
 
 ### Back up a messy folder without its duplicates
 
-`--squeeze-dups` suits folders like `Downloads` or an old photo dump, where the same file sits in several places. For each set of byte-identical files it shows you every copy and asks which one to keep. First it asks what to do with the copies you don't keep:
+`--squeeze-dups` suits folders like `Downloads` or an old photo dump, where the same file sits in several places. For each set of byte-identical files it shows you every copy and asks which one to keep. First it checks the destination is usable (not inside a source, not overlapping one), then asks what to do with the copies you don't keep:
 
 ```text
 How do you want to squeeze duplicates?
-  1) Just remove the discarded ones (moved out of the sources into DEST/<source name>/mnemo-thrash, nothing else is copied)
-  2) Squeeze and merge inside destination (the sources are left untouched)
+  1) Just remove the discarded ones (moved out of the sources into DEST/<source name>/mnemo-trash, nothing else is copied) [--squeeze-mode discard]
+  2) Squeeze and merge inside destination (the sources are left untouched) [--squeeze-mode merge]
 Choice [1-2]:
 ```
+
+To skip this question, pass `--squeeze-mode discard` (mode 1) or `--squeeze-mode merge` (mode 2).
 
 The questions about each group of duplicates are the same in both modes:
 
@@ -164,16 +167,18 @@ Save which one? [1-2], a=always first, b=always last, s=skip, q=quit: 1
 
 #### Mode 1: move the discarded copies out of the sources
 
-This keeps the chosen copy where it is and moves the others out of your source folders. They go into the destination, under a `mnemo-thrash` folder that mirrors where they came from. Nothing is deleted, and nothing else is copied.
+This keeps the chosen copy where it is and moves the others out of your source folders. They go into the destination, under a `mnemo-trash` folder that mirrors where they came from. Nothing is deleted, and nothing else is copied.
 
 ```bash
 mnemo_squeeze_dups ~/Downloads --destination /run/media/me/BIGDISK/squeezed    # then answer 1
+# or, without the question:
+mnemo_squeeze_dups ~/Downloads --destination /run/media/me/BIGDISK/squeezed --squeeze-mode discard
 ```
 
-Pressing `1` in the example above keeps `~/Downloads/baz/gem.txt` and moves `~/Downloads/foo/bar.txt` to `/run/media/me/BIGDISK/squeezed/Downloads/mnemo-thrash/foo/bar.txt`. As in mode 2, mnemo first confirms where things will go:
+Pressing `1` in the example above keeps `~/Downloads/baz/gem.txt` and moves `~/Downloads/foo/bar.txt` to `/run/media/me/BIGDISK/squeezed/Downloads/mnemo-trash/foo/bar.txt`. As in mode 2, mnemo first confirms where things will go:
 
 ```text
-Ready to squeeze duplicates. Discarded copies will be moved to /run/media/me/BIGDISK/squeezed/Downloads/mnemo-thrash. Proceed? [y/N]:
+Ready to squeeze duplicates. Discarded copies will be moved to /run/media/me/BIGDISK/squeezed/Downloads/mnemo-trash. Proceed? [y/N]:
 ```
 
 Things to know:
@@ -182,11 +187,11 @@ Things to know:
 - When the destination is on another drive, each file is copied, the copy's md5 is checked, and only then is the original deleted. If anything goes wrong, the original stays where it is.
 - Just before moving, mnemo checks the kept copy still matches. If it changed after the scan or is gone, the discarded copy stays in place with a warning.
 - A copy that is really the same file as the kept one (a hardlink, or the same file seen through a bind mount) is left alone: moving it would free nothing, or would move the kept copy itself.
-- Nothing in `mnemo-thrash` is ever overwritten. If a file of the same name is already there from an earlier run, the new one gets `~1`, `~2`, … appended.
+- Nothing in `mnemo-trash` is ever overwritten. If a file of the same name is already there from an earlier run, the new one gets `~1`, `~2`, … appended.
 - Folders left empty in the source are not removed.
-- At the end mnemo shows each source folder's size before and after, the size of its `mnemo-thrash`, and the total space spared in the sources.
+- At the end mnemo shows each source folder's size before and after, the size of its `mnemo-trash`, and the total space spared in the sources.
 - With `--dry-run`, it lists what it would move and an estimate of the space spared, and moves nothing.
-- `mnemo-thrash` sits inside `DESTINATION/<source name>`, the same folder mode 2 writes to. If you use both modes with the same destination, the trash ends up inside the squeezed copy.
+- `mnemo-trash` sits inside `DESTINATION/<source name>`, the same folder mode 2 writes to. If you use both modes with the same destination, the trash ends up inside the squeezed copy.
 
 #### Mode 2: squeeze and merge inside the destination
 
@@ -259,7 +264,7 @@ To preview the choices and the list of files that would be copied, without copyi
 mnemo_squeeze_dups ~/Downloads --destination /run/media/me/BIGDISK/squeezed --dry-run
 ```
 
-A dry run still asks which mode you want, since that decides what gets previewed.
+A dry run still asks which mode you want (unless `--squeeze-mode` is given), since that decides what gets previewed.
 
 ### Transcribe voice recordings
 
@@ -321,7 +326,7 @@ Every run writes into `logs/` in the repo, with a timestamp in each file name:
 | `mnemo_backup_stdout_*.log`, `mnemo_backup_stderr_*.log` | rsync's output during `--backup`. |
 | `mnemo_squeeze_dups_*.csv` | Every file `--squeeze-dups` copied or found up to date, as `was_dup,md5sum,path` (see below). |
 | `mnemo_squeeze_dups_stderr_*.log` | rsync's errors during `--squeeze-dups`. |
-| `mnemo_squeeze_dups_moved_*.csv` | Every file `--squeeze-dups` mode 1 moved to `mnemo-thrash`, as `moved_path,trash_path,kept_path,md5sum`. |
+| `mnemo_squeeze_dups_moved_*.csv` | Every file `--squeeze-dups` mode 1 moved to `mnemo-trash`, as `moved_path,trash_path,kept_path,md5sum`. |
 
 To follow a long backup from another terminal:
 

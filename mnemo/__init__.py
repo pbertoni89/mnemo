@@ -4,6 +4,7 @@ Each mode has its own module (backup, heavy, crowded, squeeze_dups, stt), all im
 driver.py is the command line.
 """
 import os
+import re
 import sys
 import subprocess
 import logging
@@ -110,6 +111,48 @@ def get_mountpoint(path):
     while not os.path.ismount(path):
         path = os.path.dirname(path)
     return path
+
+
+def mount_source(mountpoint):
+    """Return what is mounted at `mountpoint` (e.g. '/dev/sdb1', 'tmpfs'), from /proc/self/mountinfo.
+
+    None if it can't be found. The last matching line wins, as a later mount hides earlier ones.
+    """
+    source = None
+    try:
+        with open("/proc/self/mountinfo") as f:
+            for line in f:
+                # <id> <parent> <maj:min> <root> <mount point> <options...> - <fstype> <source> <super options>
+                left, _, right = line.partition(" - ")
+                fields, tail = left.split(), right.split()
+                if len(fields) < 5 or len(tail) < 2:
+                    continue
+                # The kernel escapes space, tab, newline and backslash in the mount point as octal, e.g. '\040'
+                target = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), fields[4])
+                if target == mountpoint:
+                    source = tail[1]
+    except OSError:
+        return None
+    return source
+
+
+def is_on_root_device(mountpoint):
+    """False only if `mountpoint` is backed by a block device other than the one behind '/'.
+
+    A different mountpoint isn't enough: btrfs subvolumes and bind mounts sit on the root
+    partition, and tmpfs or other virtual filesystems aren't a drive one could unplug.
+    """
+    source, root_source = mount_source(mountpoint), mount_source("/")
+    if not source or not source.startswith("/dev/"):
+        return True
+    return root_source is not None and os.path.realpath(source) == os.path.realpath(root_source)
+
+
+def remind_unmount(mountpoint):
+    """Remind to unmount the destination's drive, unless it lives on the root partition."""
+    if not is_on_root_device(mountpoint):
+        logger.info(f"*** Reminder: Please safely unmount '{mountpoint}' "
+                    "before physically disconnecting the drive. ***")
 
 
 def is_within(path, parent):

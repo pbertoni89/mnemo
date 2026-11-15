@@ -1,6 +1,6 @@
 """--squeeze-dups: keep one user-chosen copy of each set of identical files.
 
-Mode 1 moves the discarded copies to DEST/<source name>/mnemo-thrash; mode 2 copies a squeezed
+Mode 1 moves the discarded copies to DEST/<source name>/mnemo-trash; mode 2 copies a squeezed
 tree of each source to DEST/<source name>.
 """
 import csv
@@ -16,7 +16,7 @@ from collections import defaultdict
 from mnemo import (
     LOGS_DIR, DATE_SUFFIX, logger,
     format_elapsed, is_within, du_bytes, human_size, md5_file, ask_yes_no, ask_number,
-    check_destination_outside_sources, prepare_destination,
+    check_destination_outside_sources, prepare_destination, remind_unmount,
 )
 
 
@@ -193,6 +193,8 @@ def choose_from_groups(groups, sticky):
 
 
 SQUEEZE_MOVE, SQUEEZE_MERGE = 1, 2
+# --squeeze-mode values, so the mode can be given on the command line instead of being asked
+SQUEEZE_MODE_NAMES = {"discard": SQUEEZE_MOVE, "merge": SQUEEZE_MERGE}
 
 SQUEEZE_TRASH_DIR = "mnemo-trash"
 
@@ -201,8 +203,8 @@ def ask_squeeze_mode():
     """Ask whether to move discarded duplicates out of the sources or copy a squeezed tree to the destination."""
     print("How do you want to squeeze duplicates?\n"
           f"  1) Just remove the discarded ones (moved out of the sources into DEST/<source name>/{SQUEEZE_TRASH_DIR}, "
-          "nothing else is copied)\n"
-          "  2) Squeeze and merge inside destination (the sources are left untouched)")
+          "nothing else is copied) [--squeeze-mode discard]\n"
+          "  2) Squeeze and merge inside destination (the sources are left untouched) [--squeeze-mode merge]")
     mode = ask_number("Choice [1-2]: ", 2)
     if mode is None:
         logger.info("Aborted by user.")
@@ -211,7 +213,7 @@ def ask_squeeze_mode():
 
 
 def trash_dir(src, dest):
-    """Where mode 1 moves the discarded duplicates of `src`: dest/<basename of src>/mnemo-thrash."""
+    """Where mode 1 moves the discarded duplicates of `src`: dest/<basename of src>/mnemo-trash."""
     return os.path.join(squeeze_target(src, dest), SQUEEZE_TRASH_DIR)
 
 
@@ -250,7 +252,7 @@ def move_verified(path, target, digest):
 
 
 def move_discarded(moves, src, dest, dry_run):
-    """Move each discarded duplicate of `src` to dest/<basename>/mnemo-thrash/<path relative to src>.
+    """Move each discarded duplicate of `src` to dest/<basename>/mnemo-trash/<path relative to src>.
 
     `moves` is [(discarded_path, kept_path, digest)]. Every move is recorded in
     logs/mnemo_squeeze_dups_moved_<date>.csv (moved_path,trash_path,kept_path,md5sum).
@@ -307,7 +309,7 @@ def move_discarded(moves, src, dest, dry_run):
 
 def move_dups(sources, dest, dry_run, mountpoint):
     """Mode 1 of --squeeze-dups: keep one user-chosen copy of each set of duplicates in place, and move the
-    others to dest/<basename>/mnemo-thrash, so they leave the source without being lost.
+    others to dest/<basename>/mnemo-trash, so they leave the source without being lost.
 
     Per source: ask about every group, then move. On 'q', the choices made so far in the current
     source are still carried out, and the remaining sources are not processed.
@@ -356,21 +358,22 @@ def move_dups(sources, dest, dry_run, mountpoint):
     spared_label = "would spare about" if dry_run else "spared space:"
     logger.info(f"squeeze_dups elapsed time: {format_elapsed(start_time)}, {spared_label} {human_size(spared)}")
     if not dry_run and moved_total:
-        logger.info(f"*** Reminder: Please safely unmount '{mountpoint}' "
-                    "before physically disconnecting the drive. ***")
+        remind_unmount(mountpoint)
 
 
-def squeeze_dups(dest_raw, sources, dry_run):
-    """Keep only one user-chosen copy of each set of duplicates, in one of two modes (asked first).
+def squeeze_dups(dest_raw, sources, dry_run, mode_name=None):
+    """Keep only one user-chosen copy of each set of duplicates, in one of two modes.
 
-    1) move_dups(): move the discarded copies out of the sources into dest/<basename>/mnemo-thrash.
+    `mode_name` is a key of SQUEEZE_MODE_NAMES (from --squeeze-mode); if None, the mode is asked,
+    after the destination checks so an invalid destination fails without prompting.
+
+    1) move_dups(): move the discarded copies out of the sources into dest/<basename>/mnemo-trash.
     2) Copy each source to dest/<basename of source>: ask about every duplicate group first,
        then copy the chosen files plus every non-duplicate file in one rsync pass. On 'q', only
        the choices made so far in the current source are copied, and the remaining sources are
        not processed. At the end, logs the du -sh size of each processed source and of its copy.
     Both modes write under dest/<basename of source>, so they share the same checks and confirmation.
     """
-    mode = ask_squeeze_mode()
     start_time = time.time()
     dest = os.path.abspath(dest_raw)
 
@@ -386,12 +389,14 @@ def squeeze_dups(dest_raw, sources, dry_run):
         sys.exit(1)
 
     check_destination_outside_sources(dest, sources)
-    # e.g. --source /x/foo --destination /x would write /x/foo (or /x/foo/mnemo-thrash) onto the source
+    # e.g. --source /x/foo --destination /x would write /x/foo (or /x/foo/mnemo-trash) onto the source
     for src in sources:
         target = squeeze_target(src, dest)
         if is_within(target, src) or is_within(src, target):
             logger.error(f"Source {src} would be written to {target}, which overlaps it. Halting.")
             sys.exit(1)
+
+    mode = SQUEEZE_MODE_NAMES[mode_name] if mode_name else ask_squeeze_mode()
 
     # The default destination is easy to forget, so confirm it before creating or reading anything.
     # A dry run writes nothing, so it only states where the output would go.
@@ -462,5 +467,4 @@ def squeeze_dups(dest_raw, sources, dry_run):
             spared = (spared or 0) + src_size - target_size
     logger.info(f"squeeze_dups elapsed time: {format_elapsed(start_time)}, spared space: {human_size(spared)}")
     if not dry_run and copied:
-        logger.info(f"*** Reminder: Please safely unmount '{mountpoint}' "
-                    "before physically disconnecting the drive. ***")
+        remind_unmount(mountpoint)
