@@ -1,15 +1,36 @@
 #!/bin/bash
 
+driverPy="$(dirname "${BASH_SOURCE[0]}")"/mnemo/driver.py
 
 function mnemo_quick() {
   clear
-  "$(dirname "${BASH_SOURCE[0]}")"/mnemo/driver.py --whitelist ./whitelist.txt --blacklist ./blacklist.txt --backup
+  ${driverPy} --whitelist ./whitelist.txt --blacklist ./blacklist.txt --backup
 }
 
 
 # Usage: mnemo_squeeze_dups DIR [DIR...] [--dry-run] [--destination DEST]
 function mnemo_squeeze_dups() {
-  "$(dirname "${BASH_SOURCE[0]}")"/mnemo/driver.py --squeeze-dups --source "$@"
+  ${driverPy} --squeeze-dups --source "${@}"
+}
+
+
+# Usage: mnemo_stt DIR [DIR...] [--dry-run]
+# Writes FILE.txt next to every .m4a/.aac/.amr FILE under the given dirs.
+function mnemo_stt() {
+  ${driverPy} --stt --source "${@}"
+}
+
+
+# Usage: mnemo_sed_names FROM TO DIR [DIR...] [--dry-run]
+# Replaces FROM with TO in the name of every file and dir under the given dirs (asks first).
+function mnemo_sed_names() {
+  if [[ $# -lt 3 ]]; then
+    echo "Usage: mnemo_sed_names FROM TO DIR [DIR...] [--dry-run]" >&2
+    return 1
+  fi
+  local from="${1}" to="${2}"
+  shift 2
+  ${driverPy} --sed-names --from "${from}" --to "${to}" --source "${@}"
 }
 
 
@@ -52,13 +73,6 @@ function mnemo_stt_setup() {
 }
 
 
-# Usage: mnemo_stt DIR [DIR...] [--dry-run]
-# Writes FILE.txt next to every .m4a/.aac/.amr FILE under the given dirs.
-function mnemo_stt() {
-  "$(dirname "${BASH_SOURCE[0]}")"/mnemo/driver.py --stt --source "$@"
-}
-
-
 function mnemo_old_stuff_ignore_yet_keep_me() {
   dstPathRoot=/run/media/pbertoni/PBHDL/$(date -I"minutes")-linux-backup
   dstPathArch=${dstPathRoot}.tar.gz
@@ -75,7 +89,7 @@ function mnemo_old_stuff_ignore_yet_keep_me() {
 
   set -x
 
-  time sudo tar czfv ${dstPathArch} \
+  time sudo tar czfv "${dstPathArch}" \
     --exclude=/backup.tar.gz \
     --exclude=/dev \
     --exclude=/mnt \
@@ -89,7 +103,7 @@ function mnemo_old_stuff_ignore_yet_keep_me() {
     --exclude=/run/media/pbertoni/PBHDL \
     --exclude=/run/media/pbertoni/PBHDW \
     / \
-      | tee ${dstPathLog}
+      | tee "${dstPathLog}"
 
   set +x
 }

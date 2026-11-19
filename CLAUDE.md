@@ -4,7 +4,7 @@ This file guides Claude Code (claude.ai/code) when working in this repository.
 
 ## What this is
 
-`mnemo` is a personal backup tool: a Python 3 CLI (`mnemo/driver.py`) that wraps `rsync` to copy a set of source directories onto an external drive in increments. It has no dependencies beyond the standard library and the system tools `rsync`, `du`, `find`, `tail` and `ncdu` (optional). The one exception is `--stt`, which needs faster-whisper from the uv venv in `.venv/` (see below). There is no build step or linter config. The only test is `tests/squeeze_dups.sh`, a bash script that exercises `--squeeze-dups` on throwaway dirs in `/tmp` and exits non-zero on failure.
+`mnemo` is a personal backup tool: a Python 3 CLI (`mnemo/driver.py`) that wraps `rsync` to copy a set of source directories onto an external drive in increments. It has no dependencies beyond the standard library and the system tools `rsync`, `du`, `find`, `tail` and `ncdu` (optional). The one exception is `--stt`, which needs faster-whisper from the uv venv in `.venv/` (see below). There is no build step or linter config. The tests are bash scripts that work on throwaway dirs in `/tmp` and exit non-zero on failure: `tests/squeeze_dups.sh`, `tests/sed_names.sh`, and `tests/other_modes.sh` (`--backup`, `--heavy`, `--crowded`, `--stt --dry-run` and source handling; `--backup` runs with `--no-cache` so `.cache/cache.json` is untouched). Each run leaves `logs/` files to delete.
 
 The code is the `mnemo/` package, one module per mode, plus a small command line:
 
@@ -15,6 +15,7 @@ The code is the `mnemo/` package, one module per mode, plus a small command line
 | `mnemo/heavy.py` | `--heavy`: `find_heavy()`. |
 | `mnemo/crowded.py` | `--crowded`: `find_crowded()`. |
 | `mnemo/squeeze_dups.py` | `--squeeze-dups`: duplicate scan, group prompting, mode 1 (move to `mnemo-trash`) and mode 2 (rsync copy). |
+| `mnemo/sed_names.py` | `--sed-names`: plan, preview and apply the bulk renames. |
 | `mnemo/stt.py` | `--stt`: the venv re-exec, Whisper model loading and the transcription pool. |
 | `mnemo/__init__.py` | Shared plumbing. |
 
@@ -49,11 +50,14 @@ New code goes in the module of its mode. Helpers used by more than one mode go i
 # Copy keeping one copy of each set of duplicates (driver.sh: mnemo_squeeze_dups DIR [DIR...])
 ./mnemo/driver.py --squeeze-dups --source DIR [DIR...] [--squeeze-mode discard|merge] [--dry-run]
 
+# Replace literal text in every file/dir name under the sources (driver.sh: mnemo_sed_names FROM TO DIR [DIR...])
+./mnemo/driver.py --sed-names --source DIR [DIR...] --from OLD --to NEW [--dry-run]
+
 # Transcribe audio to sibling .txt files (driver.sh: mnemo_stt DIR [DIR...]; env built by mnemo_stt_setup [force])
 ./mnemo/driver.py --stt --source DIR [DIR...] [--dry-run]
 ```
 
-The modes `--backup`, `--heavy`, `--crowded`, `--squeeze-dups` and `--stt` are mutually exclusive, and exactly one is required. Sources come from `--source` and/or `--whitelist`; `main()` in `driver.py` makes them absolute and checks they exist.
+The modes `--backup`, `--heavy`, `--crowded`, `--squeeze-dups`, `--stt` and `--sed-names` are mutually exclusive, and exactly one is required. Sources come from `--source` and/or `--whitelist`; `main()` in `driver.py` makes them absolute and checks they exist.
 
 `driver.sh` is meant to be `source`d, not executed. `mnemo_old_stuff_ignore_yet_keep_me` is a legacy full-system `tar` backup that the user wants kept; don't delete or "clean up" it.
 
@@ -64,6 +68,7 @@ The modes `--backup`, `--heavy`, `--crowded`, `--squeeze-dups` and `--stt` are m
 - `logs/`: per-run files named with a shared `DATE_SUFFIX` (`%Y%m%d-%H%M%S`). Gitignored.
   - All modes: `mnemo_log_*`, the logger tee.
   - `--backup`: `mnemo_selected_*` (the file list) and `mnemo_backup_stdout_*` / `mnemo_backup_stderr_*` (rsync output).
+  - `--sed-names`: `mnemo_sed_names_*.csv` (`old_path,new_path`, one row per rename done, flushed as it goes).
   - `--squeeze-dups`: `mnemo_squeeze_dups_*.csv` (`was_dup,md5sum,path` for every entry sent to rsync, appended per source) and `mnemo_squeeze_dups_stderr_*`. Mode 1 writes `mnemo_squeeze_dups_moved_*.csv` instead (`moved_path,trash_path,kept_path,md5sum`, one row per file actually moved).
 - `.cache/cache.json`: `{"git_repos": {<abs source path>: [<repo dirs>]}}`. Gitignored.
 - `.venv/`: the uv environment for `--stt` (Python 3.12, faster-whisper, `av<19`, and the `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` wheels when `nvidia-smi` sees a GPU). Built by `mnemo_stt_setup`. Gitignored.
@@ -116,6 +121,16 @@ It copies each source to `DEST/<basename of source>`, keeping only one copy of e
 3. `rsync_file_list()` copies the chosen duplicates plus all singles in a single `rsync -a --from0 --files-from=LIST --out-format=%n <parent of src>/ DEST/` pass. LIST paths are relative to the parent of the source, so `--files-from`'s implied `--relative` recreates them as `DEST/<basename>/…`, so files already up to date are skipped and an existing target is overwritten. It reads rsync's stdout and logs one line per transferred file, tagged `chosen duplicate` or `non-duplicate`, skipping directory lines. It then logs how many entries were already up to date. Dry-run adds `--dry-run` and logs `[DRY-RUN] Would copy …` lines instead. It uses the same exit-code rules as `backup()`. LIST is a NUL-separated temp file, deleted afterwards. The readable record is the CSV, written with the `csv` module (so odd names are quoted). Before the copy, `squeeze_dups()` md5-hashes every single that is a regular file (not a symlink) and was never hashed, so the CSV `md5sum` is empty only for symlinks and unreadable files. This is a full read of the source, which is the expensive part on big trees. Singles come from `find_duplicate_groups()` as `(path, md5 or None)` pairs, and chosen duplicates are tracked as `(path, md5)`.
 
 On `q`, only the choices made so far in the current source are copied, without its singles, and the remaining sources aren't processed. At the end, for every source processed, it logs the size of the source and of `DEST/<basename>` (`n/a` if missing, e.g. in dry-run). The final elapsed-time line ends with `, spared space: X`, the sum of source minus copy over all processed sources. Sizes are measured with `du -s --block-size=1` (`du_bytes()`) and formatted by `human_size()`, which matches `du -h` output (1024-based, rounded up, one decimal below 10). That way the spared figure is exact, not a difference of rounded strings. Nothing in the sources is ever modified.
+
+## How `sed_names()` works
+
+`--sed-names` never touches the destination. `--from`/`--to` are validated in `driver.py` by `check_sed_names_args()`: both required, both matching `SED_NAMES_ALLOWED` (`[A-Za-z0-9._-]+`, so no `/`, no empty string, nothing a shell or regex would interpret), and different. `--from`/`--to` without `--sed-names` is an argparse error. The replacement is `str.replace`: literal, case-sensitive, every occurrence in a name.
+
+1. It halts if one source lies inside another, since its entries would be planned twice.
+2. `plan_renames()` walks each source with `os.walk(topdown=False)` and returns `[(parent, name, new_name, kind)]` (`kind` is `dir`, `file` or `link`), deepest first. Children are renamed while their parent still has its old name, so every planned path stays valid. Source roots are never renamed. Symlinks, including those to directories, are renamed as links and never followed.
+3. `find_conflicts()` marks entries to skip: the new name is `.`/`..`, something else already exists there, or an earlier entry claims the same new path. A target that `samestat`s the entry itself (a case-only rename on a case-insensitive filesystem) is not a conflict.
+4. It prints every entry in path order (`print`, as a raw listing), with conflicts tagged `[SKIPPED: target already exists]`, then logs the totals by kind. Dry-run stops here. Otherwise `ask_yes_no()` must say yes; anything else exits 1.
+5. Each rename re-checks the target right before `os.rename`, because `os.rename` silently replaces an existing file. Failures are logged and the run goes on, then exits 1 at the end.
 
 ## How `stt()` works
 

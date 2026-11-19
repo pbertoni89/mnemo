@@ -14,6 +14,7 @@ from mnemo import logger  # noqa: E402
 from mnemo.backup import backup  # noqa: E402
 from mnemo.crowded import find_crowded  # noqa: E402
 from mnemo.heavy import find_heavy  # noqa: E402
+from mnemo.sed_names import check_sed_names_args, sed_names  # noqa: E402
 from mnemo.squeeze_dups import SQUEEZE_MODE_NAMES, squeeze_dups  # noqa: E402
 from mnemo.stt import ensure_stt_runtime, stt  # noqa: E402
 
@@ -35,10 +36,18 @@ def main(args=None):
     group.add_argument("--stt", action="store_true",
                        help="Speech-to-text: write FILE.txt next to every .m4a/.aac/.amr FILE in the sources "
                             "(ignores --destination; settings via MNEMO_* env vars)")
+    group.add_argument("--sed-names", action="store_true",
+                       help="Rename every file and directory under the sources whose name contains --from, "
+                            "replacing it with --to (ignores --destination; asks for confirmation)")
 
     parser.add_argument("--squeeze-mode", choices=list(SQUEEZE_MODE_NAMES),
                         help="With --squeeze-dups: 'discard' moves the discarded copies out of the sources into "
                              "the destination, 'merge' copies a squeezed tree there. Asked if omitted")
+    parser.add_argument("--from", dest="sed_from", metavar="OLD",
+                        help="With --sed-names: the literal text to replace in names (case-sensitive; "
+                             "letters, digits, '.', '-' and '_' only)")
+    parser.add_argument("--to", dest="sed_to", metavar="NEW",
+                        help="With --sed-names: the literal text to put in its place (same characters)")
     parser.add_argument("--destination", default="/run/media/pbertoni/storage/pb-backup/",
                         help="Destination directory (USB mount expected)")
     parser.add_argument("--source", nargs='*', default=[], help="Directories to backup/analyze")
@@ -58,6 +67,12 @@ def main(args=None):
     parsed_args = parser.parse_args(args)
     if parsed_args.squeeze_mode and not parsed_args.squeeze_dups:
         parser.error("--squeeze-mode requires --squeeze-dups")
+    if parsed_args.sed_names:
+        problem = check_sed_names_args(parsed_args.sed_from, parsed_args.sed_to)
+        if problem:
+            parser.error(problem)
+    elif parsed_args.sed_from is not None or parsed_args.sed_to is not None:
+        parser.error("--from and --to require --sed-names")
 
     # Must happen before anything is logged, as it may re-exec this script under the stt venv
     if parsed_args.stt and not parsed_args.dry_run:
@@ -104,6 +119,10 @@ def main(args=None):
 
     if parsed_args.stt:
         stt(sources, parsed_args.dry_run)
+        sys.exit(0)
+
+    if parsed_args.sed_names:
+        sed_names(sources, parsed_args.sed_from, parsed_args.sed_to, parsed_args.dry_run)
         sys.exit(0)
 
     if parsed_args.squeeze_dups:

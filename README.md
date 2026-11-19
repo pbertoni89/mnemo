@@ -54,7 +54,7 @@ source ~/opt/mnemo/driver.sh   # add this to ~/.bashrc to always have them
 ## Usage
 
 ```text
-driver.py (--backup | --heavy [N] | --crowded [N] | --squeeze-dups | --stt) [options]
+driver.py (--backup | --heavy [N] | --crowded [N] | --squeeze-dups | --stt | --sed-names) [options]
 ```
 
 Pick exactly one mode.
@@ -66,12 +66,14 @@ Pick exactly one mode.
 | `--crowded [N]` | Lists the N directories with the most files in each source (default 10). |
 | `--squeeze-dups` | Keeps only one copy of each set of identical files, chosen by you. It either moves the other copies out of the sources into the destination, or copies a squeezed version of each source to the destination. |
 | `--stt` | Transcribes every `.m4a`, `.aac` and `.amr` file in the sources to a `.txt` file next to it. Ignores `--destination`. |
+| `--sed-names` | Renames every file and folder in the sources whose name contains `--from`, replacing that text with `--to`. Ignores `--destination`. |
 
 | Option | Meaning |
 |---|---|
 | `--source DIR [DIR ...]` | Directories to work on. |
 | `--whitelist FILE` | Reads the directories to work on from a file (it can be combined with `--source`). |
 | `--destination DIR` | Where to copy to. Must be on a separate mount, such as a USB drive. Default: `/run/media/pbertoni/storage/pb-backup/`. |
+| `--from OLD`, `--to NEW` | `--sed-names` only: the text to replace in names, and its replacement. |
 | `--squeeze-mode discard\|merge` | `--squeeze-dups` only: mode 1 (`discard`) or mode 2 (`merge`), so it isn't asked. |
 | `--blacklist FILE` | `rsync` exclude patterns (`--backup` only). |
 | `--exclude PAT [PAT ...]` | Extra exclude patterns on the command line (`--backup` only). |
@@ -315,6 +317,34 @@ Settings come from environment variables, for example `MNEMO_MODEL=medium MNEMO_
 | `MNEMO_BEAM_SIZE` | `5` | Beam search width. `1` is faster and a bit less accurate. |
 | `MNEMO_VAD_FILTER` | `true` | Skip silences before transcribing. This avoids invented text during long pauses. |
 
+### Rename files and folders in bulk
+
+`--sed-names` replaces a piece of text in the names of every file and folder under the sources, at any depth. Only names change: nothing is moved, and the source folders themselves keep their names.
+
+```bash
+mnemo_sed_names PB_Sogno sogno ~/Recordings/sogni --dry-run   # list what would be renamed
+mnemo_sed_names PB_Sogno sogno ~/Recordings/sogni
+# or: ./mnemo/driver.py --sed-names --source ~/Recordings/sogni --from PB_Sogno --to sogno
+```
+
+With `--from PB_Sogno --to sogno`, `AbcdPB_Sogno_Kek` becomes `Abcdsogno_Kek`. mnemo first lists every rename and the totals, then asks before touching anything:
+
+```text
+  dir   /home/me/Recordings/sogni/AbcdPB_Sogno_Kek  ->  Abcdsogno_Kek
+  file  /home/me/Recordings/sogni/AbcdPB_Sogno_Kek/20250417_PB_Sogno_Cavallo.m4a  ->  20250417_sogno_Cavallo.m4a
+2 entries to rename: 1 files and 1 directories
+Rename these 2 entries? [y/N]:
+```
+
+Things to know:
+
+- `--from` and `--to` are plain text, not patterns, and the match is case-sensitive: `pb_sogno` is left alone. Both may only contain letters, digits, `.`, `-` and `_`.
+- Every occurrence in a name is replaced: `PB_Sogno-PB_Sogno.txt` becomes `sogno-sogno.txt`.
+- Nothing is ever overwritten. If the new name is already taken, that entry is marked `[SKIPPED: target already exists]` in the list and left as it is.
+- Symlinks are renamed themselves; what they point to is not followed or changed.
+- `--dry-run` shows the list and the totals, and renames nothing.
+- `logs/mnemo_sed_names_<timestamp>.csv` lists every rename as `old_path,new_path`, so you can undo them.
+
 ## Logs
 
 Every run writes into `logs/` in the repo, with a timestamp in each file name:
@@ -326,6 +356,7 @@ Every run writes into `logs/` in the repo, with a timestamp in each file name:
 | `mnemo_backup_stdout_*.log`, `mnemo_backup_stderr_*.log` | rsync's output during `--backup`. |
 | `mnemo_squeeze_dups_*.csv` | Every file `--squeeze-dups` copied or found up to date, as `was_dup,md5sum,path` (see below). |
 | `mnemo_squeeze_dups_stderr_*.log` | rsync's errors during `--squeeze-dups`. |
+| `mnemo_sed_names_*.csv` | Every rename `--sed-names` did, as `old_path,new_path`. |
 | `mnemo_squeeze_dups_moved_*.csv` | Every file `--squeeze-dups` mode 1 moved to `mnemo-trash`, as `moved_path,trash_path,kept_path,md5sum`. |
 
 To follow a long backup from another terminal:
